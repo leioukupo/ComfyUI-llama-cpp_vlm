@@ -572,7 +572,7 @@ class llama_cpp_instruct_adv:
         save_states = save_states[0] if isinstance(save_states, list) else save_states
         unique_id = unique_id[0] if isinstance(unique_id, list) else unique_id
         parameters = parameters[0] if isinstance(parameters, list) and parameters else parameters
-        
+
         if not LLAMA_CPP_STORAGE.llm:
             LLAMA_CPP_STORAGE.load_model(llama_model)
         
@@ -743,11 +743,13 @@ class llama_cpp_instruct_adv:
             LLAMA_CPP_STORAGE.messages[f"{uid}"] = clear_message
         else:
             LLAMA_CPP_STORAGE.clean_state(uid)
-            
+        
         if force_offload:
             LLAMA_CPP_STORAGE.clean()
         else:
-            if LLAMA_CPP_STORAGE.current_config and LLAMA_CPP_STORAGE.current_config["chat_handler"] in ["Qwen3.5", "Qwen3.5-Thinking"]:
+            if LLAMA_CPP_STORAGE.current_config and LLAMA_CPP_STORAGE.current_config["chat_handler"] in [
+                "Qwen3.5", "Qwen3.5-Thinking", "Qwen3.6", "Qwen3.6-Thinking", "Qwen3.8", "Qwen3.8-Thinking"
+            ]:
                 LLAMA_CPP_STORAGE.llm.n_tokens = 0
                 LLAMA_CPP_STORAGE.llm._ctx.memory_clear(True)
                 if LLAMA_CPP_STORAGE.llm.is_hybrid and LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr is not None:
