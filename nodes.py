@@ -1,6 +1,7 @@
 import os
 import io
 import gc
+import re
 import json
 import base64
 import random
@@ -18,6 +19,7 @@ import folder_paths
 import comfy.model_management as mm
 import comfy.utils
 
+import llama_cpp
 from llama_cpp import Llama
 from llama_cpp.llama_chat_format import (
     Llava15ChatHandler, Llava16ChatHandler, MoondreamChatHandler,
@@ -60,7 +62,7 @@ except Exception:
     
 try:
     from llama_cpp.llama_chat_format import Qwen35ChatHandler
-    chat_handlers += ["Qwen3.5", "Qwen3.5-Thinking", "Qwen3.6", "Qwen3.6-Thinking"]
+    chat_handlers += ["Qwen3.5", "Qwen3.5-Thinking", "Qwen3.6", "Qwen3.6-Thinking", "Qwen3.8", "Qwen3.8-Thinking"]
 except Exception:
     Qwen35ChatHandler = None
     
@@ -122,8 +124,53 @@ class LLAMA_CPP_STORAGE:
     llm = None
     chat_handler = None
     current_config = None
+    current_embedding_mode = False
     messages = {}
     sys_prompts = {}
+    
+    @classmethod
+    def ensure_embedding_mode(cls, enable_embeddings: bool):
+        """
+        根据底层 LlamaContext 源码精准适配的毫秒级热切换
+        """
+        if not cls.llm or not hasattr(cls.llm, "_ctx") or cls.llm._ctx is None:
+            return
+        
+        # 如果当前模式已经符合要求，无需切换
+        if getattr(cls, "current_embedding_mode", None) == enable_embeddings:
+            return
+        
+        print(f"[llama-cpp_vlm] 正在无缝热切换上下文模式 (embeddings={enable_embeddings})...")
+        
+        import llama_cpp
+        ctx_class = type(cls.llm._ctx)
+        
+        # 1. 获取原生的 llama_context_params 结构体
+        if hasattr(cls.llm._ctx, "params") and cls.llm._ctx.params is not None:
+            params = cls.llm._ctx.params
+        else:
+            params = llama_cpp.llama_context_default_params()
+            
+        # 2. 修改结构体中的 n_ctx 与 embeddings 状态
+        if hasattr(params, "n_ctx"):
+            params.n_ctx = cls.current_config["n_ctx"]
+            
+        if hasattr(params, "embeddings"):
+            params.embeddings = enable_embeddings
+            
+        # 3. 关闭上一个旧 Context (保留 4GB _model 权重)
+        try:
+            cls.llm._ctx.close()
+        except Exception:
+            pass
+            
+        # 4. 精准依据类定义进行实例化 (必须使用关键字参数传参)
+        cls.llm._ctx = ctx_class(
+            model=cls.llm._model,
+            params=params,
+            verbose=False
+        )
+        cls.current_embedding_mode = enable_embeddings
 
     @classmethod
     def clean_state(cls, id=-1):
@@ -161,7 +208,7 @@ class LLAMA_CPP_STORAGE:
     def load_model(cls, config):
         def get_chat_handler(chat_handler):
             match chat_handler:
-                case "Qwen3.5"|"Qwen3.5-Thinking"|"Qwen3.6"|"Qwen3.6-Thinking":
+                case "Qwen3.5"|"Qwen3.5-Thinking"|"Qwen3.6"|"Qwen3.6-Thinking"|"Qwen3.8"|"Qwen3.8-Thinking":
                     return Qwen35ChatHandler
                 case "Qwen3-VL"|"Qwen3-VL-Thinking":
                     return Qwen3VLChatHandler
@@ -528,6 +575,8 @@ class llama_cpp_instruct_adv:
         
         if not LLAMA_CPP_STORAGE.llm:
             LLAMA_CPP_STORAGE.load_model(llama_model)
+        
+        LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
             
         if parameters is None:
             parameters = {}
@@ -635,7 +684,12 @@ class llama_cpp_instruct_adv:
                     
                 messages.append({"role": "user", "content": user_content})
                 output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
-                out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+                raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+                
+                # 使用正则剔除 <think>...</think> 及其包含的所有内容
+                clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_text, flags=re.DOTALL).strip()
+                
+                out1 = clean_text
                 out2 = [out1]
                 
             # 3. VIDEO 模式：把 list 里的每个 item 各自当成一个视频独立推理
@@ -671,9 +725,15 @@ class llama_cpp_instruct_adv:
                 messages.append({"role": "user", "content": user_content})
         else:
             # 纯文本模式
-            messages.append({"role": "user", "content": user_content})
+            text_string = "".join([item["text"] for item in user_content if item.get("type") == "text"])
+            messages.append({"role": "user", "content": text_string})
             output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
-            out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+            raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+            
+            # 使用正则剔除 <think>...</think> 及其包含的所有内容
+            clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_text, flags=re.DOTALL).strip()
+            
+            out1 = clean_text
             out2 = [out1]
             
         if save_states:
@@ -1254,6 +1314,216 @@ class PromptEnhancerPreset:
             case _:
                 raise ValueError(f'Unknown preset: "{preset}"')
 
+class llama_cpp_text_encoder:
+    """
+    统一的 Llama-cpp Text Encoder 节点。
+    支持替代 Z-Image, Lumina2, Qwen-Image, MiniMax T2V, Boogu-Image, JoyImage, Mage-Flow 等原生文本编码器。
+    """
+    PRESETS = {
+        "Boogu-Image": {
+            "template": "<|im_start|>system\nYou are a helpful assistant that generates high-quality images based on user instructions. The instructions are as follows.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n",
+            "layer_idx": -1,
+            "trim_template": False,
+        },
+        "JoyImage": {
+            "template": "<|im_start|>system\n \\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "layer_idx": -1,
+            "trim_template": True,
+        },
+        "Lumina2": {
+            "template": "{}",
+            "layer_idx": -2,
+            "trim_template": False,
+        },
+        "Mage-Flow": {
+            "template": "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "layer_idx": -1,
+            "trim_template": True,
+        },
+        "MiniMax-T2V": {
+            "template": "{}",
+            "layer_idx": 49,
+            "trim_template": False,
+            "is_minimax_t2v": True,
+        },
+        "Qwen-Image": {
+            "template": "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "layer_idx": -1,
+            "trim_template": True,
+        },
+        "Z-Image": {
+            "template": "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "layer_idx": -2,
+            "trim_template": False,
+        },
+    }
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "llama_model": ("LLAMACPPMODEL",),
+                "prompt": ("STRING", {"multiline": True, "default": "", "dynamicPrompts": True}),
+                "type": (list(s.PRESETS.keys()), {"default": "Z-Image"}),
+                "force_offload": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Unload the model after inference."
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "encode"
+    CATEGORY = "llama-cpp-vlm"
+    
+    def _extract_native_embeddings(self, llm, prompt_text, target_layer, tokens):
+        import ctypes
+        
+        # 1. 目标层换算 (负数层转正数)
+        model = getattr(llm, "_model", None) or getattr(llm, "model", None) or llm
+        n_layers = getattr(model, "n_layer", None) or getattr(llm, "n_layer", None)
+        if callable(n_layers):
+            n_layers = n_layers()
+            
+        pos_layer = (n_layers + target_layer) if (n_layers is not None and target_layer < 0) else target_layer
+        
+        # 尝试通过原生接口设置目标层
+        if hasattr(model, "set_target_layer_ids") and callable(model.set_target_layer_ids):
+            try: model.set_target_layer_ids([pos_layer])
+            except Exception: pass
+        elif hasattr(model, "target_layer_ids"):
+            if callable(model.target_layer_ids):
+                try: 
+                    t_ids = model.target_layer_ids()
+                    if isinstance(t_ids, list):
+                        t_ids.clear()
+                        t_ids.append(pos_layer)
+                except Exception: pass
+                
+        num_tokens = len(tokens)
+        
+        # 2. 安全清理状态
+        if hasattr(llm, "n_tokens"):
+            llm.n_tokens = 0
+        if hasattr(llm, "_ctx"):
+            if hasattr(llm._ctx, "kv_cache_clear"):
+                llm._ctx.kv_cache_clear()
+            elif hasattr(llm._ctx, "memory_clear"):
+                llm._ctx.memory_clear(True)
+                
+        # 3. 执行推理计算
+        llm.eval(tokens)
+        
+        # 4. 从上下文中提取深层特征
+        ctx_ptr = getattr(llm, "ctx", None) or getattr(getattr(llm, "_ctx", None), "ctx", None)
+        n_embd = llm.n_embd() if callable(getattr(llm, "n_embd", None)) else getattr(llm, "n_embd", 4096)
+        
+        emb_np = None
+        
+        # 优先提取指定层激活状态
+        for fn_name in ["llama_get_layer_state", "llama_get_layer_embeddings", "llama_get_layer_output"]:
+            if hasattr(llama_cpp, fn_name):
+                fn = getattr(llama_cpp, fn_name)
+                try:
+                    ptr = fn(ctx_ptr, ctypes.c_int(pos_layer))
+                    if ptr:
+                        emb_np = np.ctypeslib.as_array(ptr, shape=(num_tokens, n_embd)).copy()
+                        break
+                except Exception: pass
+                
+        # 备选提取
+        if emb_np is None:
+            if hasattr(llama_cpp, "llama_get_embeddings_ith"):
+                token_embeds = []
+                for i in range(num_tokens):
+                    ptr = llama_cpp.llama_get_embeddings_ith(ctx_ptr, ctypes.c_int(i))
+                    if ptr:
+                        token_embeds.append(np.ctypeslib.as_array(ptr, shape=(n_embd,)).copy())
+                if len(token_embeds) == num_tokens:
+                    emb_np = np.stack(token_embeds, axis=0)
+                    
+            if emb_np is None and hasattr(llama_cpp, "llama_get_embeddings"):
+                ptr = llama_cpp.llama_get_embeddings(ctx_ptr)
+                if ptr:
+                    emb_np = np.ctypeslib.as_array(ptr, shape=(num_tokens, n_embd)).copy()
+                    
+        if emb_np is None:
+            raise RuntimeError(f"提取 Layer {pos_layer} 失败！请确保模型加载时启用了 'embeddings=True'。")
+            
+        # 5. 转为 Tensor 并规范维度为 [1, seq_len, hidden_dim]
+        emb = torch.tensor(emb_np, dtype=torch.float32)
+        if emb.ndim == 2:
+            emb = emb.unsqueeze(0)
+        elif emb.ndim == 1:
+            emb = emb.unsqueeze(0).unsqueeze(0)
+            
+        return emb
+    
+    def encode(self, llama_model, prompt, type, force_offload):
+        if not LLAMA_CPP_STORAGE.llm:
+            LLAMA_CPP_STORAGE.load_model(llama_model)
+        
+        LLAMA_CPP_STORAGE.ensure_embedding_mode(True)
+            
+        llm = LLAMA_CPP_STORAGE.llm
+        cfg = self.PRESETS[type]
+        
+        target_layer = cfg["layer_idx"]
+        prompt_text = cfg["template"].format(prompt) if "{}" in cfg["template"] else prompt
+        
+        # 【关键修复 1】：必须加 special=True，否则 <|im_start|> 无法被解析为 151644
+        tokens = llm.tokenize(prompt_text.encode("utf-8"), add_bos=False, special=True)
+        if len(tokens) == 0:
+            tokens = [151643]
+        
+        # MiniMax 严格要求纯净文本，不能有任何 BOS (151643 / 151644 / 1)
+        if cfg.get("is_minimax_t2v", False) and len(tokens) > 1:
+            if tokens[0] in [151643, 151644, 1]:
+                tokens = tokens[1:]  # 剥离开头的 BOS Token
+        
+        # 提取特征
+        hidden_tensor = self._extract_native_embeddings(llm, prompt_text, target_layer, tokens)
+        
+        # 【关键修复 2】：更鲁棒的裁切验证
+        if cfg.get("trim_template", False) and len(tokens) > 3:
+            trim_idx = 0
+            count_im_start = 0
+            for i in range(len(tokens) - 2):
+                if tokens[i] == 151644:  # <|im_start|>
+                    count_im_start += 1
+                    if count_im_start == 2: 
+                        # 找到了 user block 的开始
+                        if tokens[i+1] == 872 and tokens[i+2] == 198: # user \n
+                            trim_idx = i + 3
+                        else:
+                            trim_idx = i + 1
+                        break
+                
+            # 执行特征截断
+            if trim_idx > 0 and hidden_tensor.shape[1] > trim_idx:
+                hidden_tensor = hidden_tensor[:, trim_idx:, :]
+            else:
+                print(f"\n[llama-cpp_vlm] Warning: Trim failed! Token IDs: {tokens[:10]}...")
+                
+        seq_len = hidden_tensor.shape[1]
+        pooled = torch.zeros((hidden_tensor.shape[0], hidden_tensor.shape[-1]), dtype=torch.float32)
+        
+        # 构造 Conditioning 字典
+        cond_dict = {"pooled_output": pooled}
+        
+        # MiniMax T2V 专属标记
+        if cfg.get("is_minimax_t2v", False):
+            cond_dict["minimax_token_tags"] = torch.ones(seq_len, dtype=torch.long)
+        
+        print(f"\n[MiniMax Diagnostic] Tensor Shape: {hidden_tensor.shape}, Mean: {hidden_tensor.mean().item():.4f}, Std: {hidden_tensor.std().item():.4f}\n")
+        conditioning = [[hidden_tensor, cond_dict]]
+        
+        if force_offload:
+            LLAMA_CPP_STORAGE.clean()
+        
+        return (conditioning,)
+
 NODE_CLASS_MAPPINGS = {
     "llama_cpp_model_loader": llama_cpp_model_loader,
     "llama_cpp_instruct_adv": llama_cpp_instruct_adv,
@@ -1267,6 +1537,7 @@ NODE_CLASS_MAPPINGS = {
     "bboxes_to_bbox": bboxes_to_bbox,
     "remove_code_block": remove_code_block,
     "PromptEnhancerPreset": PromptEnhancerPreset,
+    "llama_cpp_text_encoder": llama_cpp_text_encoder,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1282,4 +1553,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "bboxes_to_bbox": "BBoxes to BBox",
     "remove_code_block": "Unpack Code Block",
     "PromptEnhancerPreset": "Prompt Enhancer Preset",
+    "llama_cpp_text_encoder": "Llama-cpp Text Encoder (BETA)",
 }
