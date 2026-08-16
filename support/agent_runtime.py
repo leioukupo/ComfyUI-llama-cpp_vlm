@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import re
 import threading
@@ -42,6 +43,59 @@ def run_coro_sync(coro: Awaitable[Any]) -> Any:
     if "error" in result:
         raise result["error"]
     return result.get("value")
+
+
+class _AsyncLoopThread:
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+        self.loop.close()
+
+    def call(self, coro: Awaitable[Any]) -> Any:
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result()
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join()
+
+
+class SyncMCPToolbox:
+    def __init__(self, config: MCPRuntimeConfig):
+        self.config = config
+        self.loop_thread: Optional[_AsyncLoopThread] = None
+        self.toolbox: Optional[MCPToolbox] = None
+
+    def __enter__(self) -> "SyncMCPToolbox":
+        self.loop_thread = _AsyncLoopThread()
+        self.toolbox = MCPToolbox(self.config)
+        try:
+            self.loop_thread.call(self.toolbox.__aenter__())
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.loop_thread is not None and self.toolbox is not None:
+            self.loop_thread.call(self.toolbox.__aexit__(exc_type, exc_val, exc_tb))
+        if self.loop_thread is not None:
+            self.loop_thread.close()
+        self.loop_thread = None
+        self.toolbox = None
+
+    def openai_tools(self) -> List[Dict[str, Any]]:
+        return self.toolbox.openai_tools() if self.toolbox is not None else []
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> MCPCallResult:
+        if self.loop_thread is None or self.toolbox is None:
+            return MCPCallResult(content="MCP toolbox is not connected.", is_error=True)
+        return self.loop_thread.call(self.toolbox.call_tool(name, arguments))
 
 
 @dataclass
@@ -244,9 +298,12 @@ class AgentRunner:
         self.native_tools_supported = True
 
     def run(self, messages: List[Dict[str, Any]]) -> AgentRunResult:
-        return run_coro_sync(self.arun(messages))
+        return self._run_sync(messages)
 
     async def arun(self, messages: List[Dict[str, Any]]) -> AgentRunResult:
+        return self._run_sync(messages)
+
+    def _run_sync(self, messages: List[Dict[str, Any]]) -> AgentRunResult:
         trace: List[Dict[str, Any]] = []
         tool_callbacks: Dict[str, Callable[[Dict[str, Any]], Any]] = {}
         tools: List[Dict[str, Any]] = []
@@ -261,7 +318,7 @@ class AgentRunner:
                     tools.append(spec)
                     tool_callbacks[name] = lambda args, tool_name=name, lang=skill_language: self._call_skill_tool(tool_name, args, lang)
 
-        async with MCPToolbox(self.mcp_config) as mcp_tools:
+        with SyncMCPToolbox(self.mcp_config) as mcp_tools:
             for spec in mcp_tools.openai_tools():
                 name = _tool_name(spec)
                 if name:
@@ -295,7 +352,7 @@ class AgentRunner:
                 if calls[0].source == "native":
                     working_messages.append(assistant_message)
                     for call in calls:
-                        result = await self._execute_tool(call, tool_callbacks)
+                        result = self._execute_tool(call, tool_callbacks)
                         working_messages.append(
                             {
                                 "role": "tool",
@@ -309,7 +366,7 @@ class AgentRunner:
                     working_messages.append({"role": "assistant", "content": content})
                     fallback_results = []
                     for call in calls:
-                        result = await self._execute_tool(call, tool_callbacks)
+                        result = self._execute_tool(call, tool_callbacks)
                         fallback_results.append(
                             {
                                 "name": call.name,
@@ -362,7 +419,7 @@ class AgentRunner:
 
         return self.llm.create_chat_completion(messages=messages, seed=self.seed, **kwargs)
 
-    async def _execute_tool(
+    def _execute_tool(
         self,
         call: AgentToolCall,
         callbacks: Dict[str, Callable[[Dict[str, Any]], Any]],
@@ -373,8 +430,8 @@ class AgentRunner:
 
         try:
             result = callback(call.arguments)
-            if asyncio.iscoroutine(result):
-                result = await result
+            if inspect.isawaitable(result):
+                result = run_coro_sync(result)
             if isinstance(result, MCPCallResult):
                 return result
             text = str(result)
