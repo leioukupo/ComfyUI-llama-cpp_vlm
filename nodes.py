@@ -6,6 +6,8 @@ import base64
 import random
 import torch
 import inspect
+import importlib.metadata
+import platform
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -209,6 +211,20 @@ class LLAMA_CPP_STORAGE:
     
     @classmethod
     def load_model(cls, config):
+        def check_llama_cpp_backend():
+            try:
+                version = importlib.metadata.version("llama-cpp-python")
+            except Exception:
+                version = getattr(llama_cpp, "__version__", "unknown")
+            module_path = getattr(llama_cpp, "__file__", "unknown")
+            system = platform.system()
+            print(f"[llama-cpp_vlm] llama-cpp-python version = {version}")
+            print(f"[llama-cpp_vlm] llama_cpp module = {module_path}")
+            if system in ["Linux", "Windows"] and "+cu" not in str(version).lower():
+                print("[llama-cpp_vlm] WARNING: This looks like a CPU llama-cpp-python wheel. Install the CUDA wheel from this node's requirements.txt/requirements_cu130.txt and restart ComfyUI.")
+            elif system == "Darwin" and "metal" not in str(version).lower():
+                print("[llama-cpp_vlm] NOTE: On macOS, make sure llama-cpp-python was installed with Metal support.")
+            
         def get_chat_handler(chat_handler):
             match chat_handler:
                 case "Qwen3.5"|"Qwen3.5-Thinking"|"Qwen3.6"|"Qwen3.6-Thinking"|"Qwen3.8"|"Qwen3.8-Thinking":
@@ -261,6 +277,7 @@ class LLAMA_CPP_STORAGE:
                     raise ValueError(f'Unknown model type: "{chat_handler}"')
         
         cls.clean(all=True)
+        check_llama_cpp_backend()
         cls.current_config = config.copy()
         model = config["model"]
         mmproj = config["mmproj"]
