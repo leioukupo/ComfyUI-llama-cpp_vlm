@@ -97,7 +97,7 @@ def get_layer_count(path):
         if k.lower().endswith(".block_count"):
             return v
     
-    print(f"Failed to read metadata: {e}")
+    print("Failed to find block_count in the fast GGUF metadata pass.")
     print(f"Try reading the entire GGUF...")
     
     from gguf import GGUFReader

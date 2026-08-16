@@ -1,7 +1,6 @@
 import os
 import io
 import gc
-import re
 import json
 import base64
 import random
@@ -14,6 +13,9 @@ from scipy.ndimage import gaussian_filter
 from .support.cqdm import cqdm
 from .support.gguf_layers import get_layer_count
 from .support.prompt_enhancer_preset import *
+from .support.agent_runtime import AgentRunner, strip_thinking
+from .support.mcp_runtime import parse_mcp_config
+from .support.skill_runtime import scan_skill_directory
 
 import folder_paths
 import comfy.model_management as mm
@@ -198,6 +200,7 @@ class LLAMA_CPP_STORAGE:
         cls.llm = None
         cls.chat_handler = None
         cls.current_config = None
+        cls.current_embedding_mode = False
         if all:
             cls.clean_state()
         
@@ -297,7 +300,7 @@ class LLAMA_CPP_STORAGE:
                 kwargs["force_reasoning"] = think_mode
                 kwargs["image_max_tokens"] = image_max_tokens
                 kwargs["image_min_tokens"] = image_min_tokens
-            elif any(x in chat_handler for x in ["GLM-4.6V" "MiniCPM-v4.5", "MiniCPM-v4.6", "Qwen3.5", "Qwen3.6", "Qwen3.8"]):
+            elif any(x in chat_handler for x in ["GLM-4.6V", "MiniCPM-v4.5", "MiniCPM-v4.6", "Qwen3.5", "Qwen3.6", "Qwen3.8"]):
                 kwargs["enable_thinking"] = think_mode
 
             if _MTMD:
@@ -581,11 +584,11 @@ class llama_cpp_instruct_adv:
         if parameters is None:
             parameters = {}
             
-        if _MTMD:
-            parameters.pop("present_penalty", None)
-            
-        _uid = parameters.get("state_uid", None)
         _parameters = parameters.copy()
+        if _MTMD:
+            _parameters.pop("present_penalty", None)
+            
+        _uid = _parameters.get("state_uid", None)
         _parameters.pop("state_uid", None)
         uid = str(unique_id).rpartition('.')[-1] if _uid in (None, -1) else str(_uid)
         
@@ -657,7 +660,7 @@ class llama_cpp_instruct_adv:
                         
                     curr_messages = messages + [{"role": "user", "content": curr_user_content}]
                     output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=curr_messages, seed=seed, **_parameters)
-                    text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+                    text = strip_thinking(output['choices'][0]['message']['content'].removeprefix(": ").lstrip())
                     
                     out2.append(text)
                     if len(image_groups) > 1:
@@ -684,12 +687,7 @@ class llama_cpp_instruct_adv:
                     
                 messages.append({"role": "user", "content": user_content})
                 output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
-                raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                
-                # 使用正则剔除 <think>...</think> 及其包含的所有内容
-                clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_text, flags=re.DOTALL).strip()
-                
-                out1 = clean_text
+                out1 = strip_thinking(output['choices'][0]['message']['content'].removeprefix(": ").lstrip())
                 out2 = [out1]
                 
             # 3. VIDEO 模式：把 list 里的每个 item 各自当成一个视频独立推理
@@ -714,7 +712,7 @@ class llama_cpp_instruct_adv:
                         
                     curr_messages = messages + [{"role": "user", "content": curr_user_content}]
                     output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=curr_messages, seed=seed, **_parameters)
-                    text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+                    text = strip_thinking(output['choices'][0]['message']['content'].removeprefix(": ").lstrip())
                     
                     out2.append(text)
                     if len(image_groups) > 1:
@@ -728,12 +726,7 @@ class llama_cpp_instruct_adv:
             text_string = "".join([item["text"] for item in user_content if item.get("type") == "text"])
             messages.append({"role": "user", "content": text_string})
             output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
-            raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-            
-            # 使用正则剔除 <think>...</think> 及其包含的所有内容
-            clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_text, flags=re.DOTALL).strip()
-            
-            out1 = clean_text
+            out1 = strip_thinking(output['choices'][0]['message']['content'].removeprefix(": ").lstrip())
             out2 = [out1]
             
         if save_states:
@@ -788,6 +781,336 @@ class llama_cpp_parameters:
     CATEGORY = "llama-cpp-vlm"
     def process(self, **kwargs):
         return (kwargs,)
+
+class llama_cpp_skill_library:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "skill_dir": ("STRING", {
+                    "default": "skills",
+                    "multiline": False,
+                    "tooltip": "Local skill directory. Relative paths are resolved from this custom node folder."
+                }),
+                "language": (["auto", "en", "zh"], {"default": "auto"}),
+                "selected_skills": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Optional skill names, one per line. Empty = all skills in the directory."
+                }),
+                "max_skill_chars": ("INT", {"default": 24000, "min": 1000, "max": 200000, "step": 1000}),
+                "max_file_chars": ("INT", {"default": 20000, "min": 1000, "max": 200000, "step": 1000}),
+            }
+        }
+
+    RETURN_TYPES = ("LLAMACPPSKILLS",)
+    RETURN_NAMES = ("skills",)
+    FUNCTION = "process"
+    CATEGORY = "llama-cpp-vlm/agent"
+
+    def process(self, skill_dir, language, selected_skills, max_skill_chars, max_file_chars):
+        library = scan_skill_directory(
+            skill_dir=skill_dir,
+            selected_skills=selected_skills,
+            language=language,
+            max_skill_chars=max_skill_chars,
+            max_file_chars=max_file_chars,
+        )
+        print(f"[llama-cpp_vlm] Loaded {len(library.available_entries())} local skills from {library.root}")
+        return (library,)
+
+class llama_cpp_mcp_config:
+    DEFAULT_CONFIG = '''{
+  "mcpServers": {
+  }
+}'''
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mcp_json": ("STRING", {
+                    "default": s.DEFAULT_CONFIG,
+                    "multiline": True,
+                    "placeholder": '{"mcpServers":{"demo":{"command":"python3","args":["server.py"]}}}'
+                }),
+                "max_agent_steps": ("INT", {
+                    "default": 6,
+                    "min": 1,
+                    "max": 32,
+                    "step": 1,
+                    "tooltip": "Maximum model/tool rounds per Agent Instruct call."
+                }),
+                "tool_timeout_sec": ("FLOAT", {
+                    "default": 60.0,
+                    "min": 0.5,
+                    "max": 3600.0,
+                    "step": 0.5,
+                    "tooltip": "Timeout for listing or calling MCP tools."
+                }),
+                "max_tool_result_chars": ("INT", {
+                    "default": 12000,
+                    "min": 256,
+                    "max": 200000,
+                    "step": 256,
+                    "tooltip": "Maximum characters returned from each tool call."
+                }),
+                "auto_execute": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Automatically execute all tool calls emitted by the model."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("LLAMACPPMCP",)
+    RETURN_NAMES = ("mcp_config",)
+    FUNCTION = "process"
+    CATEGORY = "llama-cpp-vlm/agent"
+
+    def process(self, mcp_json, max_agent_steps, tool_timeout_sec, max_tool_result_chars, auto_execute):
+        config = parse_mcp_config(
+            mcp_json,
+            max_agent_steps=max_agent_steps,
+            tool_timeout_sec=tool_timeout_sec,
+            max_tool_result_chars=max_tool_result_chars,
+            auto_execute=auto_execute,
+        )
+        print(f"[llama-cpp_vlm] MCP config loaded with {len(config.servers)} server(s).")
+        return (config,)
+
+class llama_cpp_agent_instruct(llama_cpp_instruct_adv):
+    @classmethod
+    def INPUT_TYPES(s):
+        types = llama_cpp_instruct_adv.INPUT_TYPES()
+        types["optional"] = dict(types.get("optional", {}))
+        types["optional"]["skills"] = ("LLAMACPPSKILLS",)
+        types["optional"]["mcp_config"] = ("LLAMACPPMCP",)
+        return types
+
+    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING")
+    RETURN_NAMES = ("output", "output_list", "state_uid", "tool_trace", "selected_skills")
+    OUTPUT_IS_LIST = (False, True, False, False, False)
+    INPUT_IS_LIST = True
+    FUNCTION = "process"
+    CATEGORY = "llama-cpp-vlm/agent"
+
+    def _run_agent(self, messages, seed, parameters, skills, mcp_config):
+        runner = AgentRunner(
+            LLAMA_CPP_STORAGE.llm,
+            seed=seed,
+            parameters=parameters,
+            skill_library=skills,
+            mcp_config=mcp_config,
+        )
+        return runner.run(messages)
+
+    def _append_agent_trace(self, trace_list, selected_skills, result, scope):
+        for event in result.trace:
+            item = event.copy()
+            if scope:
+                item["scope"] = scope
+            trace_list.append(item)
+        for name in result.selected_skills:
+            if name not in selected_skills:
+                selected_skills.append(name)
+
+    def process(self, llama_model, preset_prompt, custom_prompt, system_prompt, inference_mode, max_frames, max_size, seed, force_offload, save_states, unique_id, parameters=None, images=None, queue_handler=None, skills=None, mcp_config=None):
+        llama_model = llama_model[0] if isinstance(llama_model, list) else llama_model
+        preset_prompt = preset_prompt[0] if isinstance(preset_prompt, list) else preset_prompt
+        custom_prompt = custom_prompt[0] if isinstance(custom_prompt, list) else custom_prompt
+        system_prompt = system_prompt[0] if isinstance(system_prompt, list) else system_prompt
+        inference_mode = inference_mode[0] if isinstance(inference_mode, list) else inference_mode
+        max_frames = max_frames[0] if isinstance(max_frames, list) else max_frames
+        max_size = max_size[0] if isinstance(max_size, list) else max_size
+        seed = seed[0] if isinstance(seed, list) else seed
+        force_offload = force_offload[0] if isinstance(force_offload, list) else force_offload
+        save_states = save_states[0] if isinstance(save_states, list) else save_states
+        unique_id = unique_id[0] if isinstance(unique_id, list) else unique_id
+        parameters = parameters[0] if isinstance(parameters, list) and parameters else parameters
+        skills = skills[0] if isinstance(skills, list) and skills else skills
+        mcp_config = mcp_config[0] if isinstance(mcp_config, list) and mcp_config else mcp_config
+
+        if not LLAMA_CPP_STORAGE.llm:
+            LLAMA_CPP_STORAGE.load_model(llama_model)
+        
+        LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
+            
+        if parameters is None:
+            parameters = {}
+            
+        _parameters = parameters.copy()
+        if _MTMD:
+            _parameters.pop("present_penalty", None)
+            
+        _uid = _parameters.get("state_uid", None)
+        _parameters.pop("state_uid", None)
+        uid = str(unique_id).rpartition('.')[-1] if _uid in (None, -1) else str(_uid)
+        
+        last_sys_prompt = LLAMA_CPP_STORAGE.sys_prompts.get(f"{uid}", None)
+        video_input = inference_mode == "video"
+        system_prompts = "请将输入的图片序列当做视频而不是静态帧序列, " + system_prompt if video_input else system_prompt
+        
+        if last_sys_prompt != system_prompts:
+            messages = []
+            LLAMA_CPP_STORAGE.clean_state(uid)
+            LLAMA_CPP_STORAGE.sys_prompts[f"{uid}"] = system_prompts
+            if system_prompts.strip():
+                messages.append({"role": "system", "content": system_prompts})
+        else:
+            if save_states:
+                try:
+                    print(f"[llama-cpp_vlm] Loading state and history id={uid}...")
+                    messages = LLAMA_CPP_STORAGE.messages.get(f"{uid}", [])
+                except Exception:
+                    messages = []
+            else:
+                messages = []
+                
+        out1 = ""
+        out2 = []
+        tool_trace = []
+        selected_skill_names = []
+        user_content = []
+        if custom_prompt.strip() and "*" not in preset_prompt:
+            user_content.append({"type": "text", "text": custom_prompt})
+        else:
+            p = preset_prompts[preset_prompt].replace("#", custom_prompt.strip()).replace("@", "video" if video_input else "image")
+            user_content.append({"type": "text", "text": p})
+            
+        raw_image_list = [img for img in images if img is not None] if images is not None else []
+        
+        if raw_image_list:
+            curr_mmproj = LLAMA_CPP_STORAGE.current_config.get("mmproj") if LLAMA_CPP_STORAGE.current_config else None
+            if LLAMA_CPP_STORAGE.chat_handler is None or curr_mmproj in [None, "None"]:
+                raise ValueError("Image input detected, but the loaded model is not configured with a mmproj module.")
+                
+            image_groups = []
+            for img_item in raw_image_list:
+                if img_item.ndim == 3:
+                    image_groups.append([img_item])
+                elif img_item.ndim == 4:
+                    image_groups.append([img_item[i] for i in range(img_item.shape[0])])
+                    
+            if inference_mode == "one by one":
+                print(f"[llama-cpp_vlm] [Agent One-by-One Mode] Processing {len(image_groups)} list items individually...")
+                tmp_list = []
+                
+                for item_idx, item_frames in enumerate(cqdm(image_groups)):
+                    if mm.processing_interrupted():
+                        raise mm.InterruptProcessingException()
+                        
+                    curr_user_content = json.loads(json.dumps(user_content))
+                    for frame in item_frames:
+                        if len(item_frames) > 1:
+                            data = image2base64(scale_image(frame, max_size))
+                        else:
+                            data = image2base64(np.clip(255.0 * frame.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+                            
+                        curr_user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{data}"}
+                        })
+                        
+                    curr_messages = messages + [{"role": "user", "content": curr_user_content}]
+                    result = self._run_agent(curr_messages, seed, _parameters, skills, mcp_config)
+                    text = strip_thinking(result.output)
+                    self._append_agent_trace(tool_trace, selected_skill_names, result, f"item_{item_idx+1}")
+                    
+                    out2.append(text)
+                    if len(image_groups) > 1:
+                        tmp_list.append(f"====== Item {item_idx+1} ======")
+                    tmp_list.append(text)
+                    
+                out1 = "\n\n".join(tmp_list)
+                messages.append({"role": "user", "content": user_content})
+                
+            elif inference_mode == "images":
+                all_frames = [frame for group in image_groups for frame in group]
+                print(f"[llama-cpp_vlm] [Agent Images Mode] Packing ALL {len(all_frames)} images into 1 single completion...")
+                
+                for frame in all_frames:
+                    if len(all_frames) > 1:
+                        data = image2base64(scale_image(frame, max_size))
+                    else:
+                        data = image2base64(np.clip(255.0 * frame.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{data}"}
+                    })
+                    
+                messages.append({"role": "user", "content": user_content})
+                result = self._run_agent(messages, seed, _parameters, skills, mcp_config)
+                out1 = strip_thinking(result.output)
+                out2 = [out1]
+                self._append_agent_trace(tool_trace, selected_skill_names, result, "images")
+                
+            elif inference_mode == "video":
+                print(f"[llama-cpp_vlm] [Agent Video Mode] Processing {len(image_groups)} video clips...")
+                tmp_list = []
+                
+                for v_idx, video_frames in enumerate(cqdm(image_groups)):
+                    if mm.processing_interrupted():
+                        raise mm.InterruptProcessingException()
+                        
+                    indices = np.linspace(0, len(video_frames) - 1, min(len(video_frames), max_frames), dtype=int)
+                    sampled_frames = [video_frames[i] for i in indices]
+                    
+                    curr_user_content = json.loads(json.dumps(user_content))
+                    for frame in sampled_frames:
+                        data = image2base64(scale_image(frame, max_size))
+                        curr_user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{data}"}
+                        })
+                        
+                    curr_messages = messages + [{"role": "user", "content": curr_user_content}]
+                    result = self._run_agent(curr_messages, seed, _parameters, skills, mcp_config)
+                    text = strip_thinking(result.output)
+                    self._append_agent_trace(tool_trace, selected_skill_names, result, f"video_{v_idx+1}")
+                    
+                    out2.append(text)
+                    if len(image_groups) > 1:
+                        tmp_list.append(f"====== Video Clip {v_idx+1} ======")
+                    tmp_list.append(text)
+                    
+                out1 = "\n\n".join(tmp_list)
+                messages.append({"role": "user", "content": user_content})
+        else:
+            text_string = "".join([item["text"] for item in user_content if item.get("type") == "text"])
+            messages.append({"role": "user", "content": text_string})
+            result = self._run_agent(messages, seed, _parameters, skills, mcp_config)
+            out1 = strip_thinking(result.output)
+            out2 = [out1]
+            self._append_agent_trace(tool_trace, selected_skill_names, result, "text")
+            
+        if save_states:
+            print(f"[llama-cpp_vlm] Saving state id={uid}...")
+            messages.append({"role": "assistant", "content": out1})
+            clear_message = self.sanitize_messages(messages)
+            LLAMA_CPP_STORAGE.messages[f"{uid}"] = clear_message
+        else:
+            LLAMA_CPP_STORAGE.clean_state(uid)
+        
+        if force_offload:
+            LLAMA_CPP_STORAGE.clean()
+        else:
+            if LLAMA_CPP_STORAGE.current_config and LLAMA_CPP_STORAGE.current_config["chat_handler"] in [
+                "Qwen3.5", "Qwen3.5-Thinking", "Qwen3.6", "Qwen3.6-Thinking", "Qwen3.8", "Qwen3.8-Thinking"
+            ]:
+                LLAMA_CPP_STORAGE.llm.n_tokens = 0
+                LLAMA_CPP_STORAGE.llm._ctx.memory_clear(True)
+                if LLAMA_CPP_STORAGE.llm.is_hybrid and LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr is not None:
+                    LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr.clear()
+                    
+        del messages
+        gc.collect()
+        return (
+            out1,
+            out2,
+            uid,
+            json.dumps(tool_trace, ensure_ascii=False, indent=2),
+            json.dumps(selected_skill_names, ensure_ascii=False),
+        )
     
 class llama_cpp_clean_states:
     @classmethod
@@ -1530,6 +1853,9 @@ NODE_CLASS_MAPPINGS = {
     "llama_cpp_model_loader": llama_cpp_model_loader,
     "llama_cpp_instruct_adv": llama_cpp_instruct_adv,
     "llama_cpp_parameters": llama_cpp_parameters,
+    "llama_cpp_skill_library": llama_cpp_skill_library,
+    "llama_cpp_mcp_config": llama_cpp_mcp_config,
+    "llama_cpp_agent_instruct": llama_cpp_agent_instruct,
     "llama_cpp_unload_model": llama_cpp_unload_model,
     "llama_cpp_clean_states": llama_cpp_clean_states,
     "parse_json_node": parse_json_node,
@@ -1546,6 +1872,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "llama_cpp_model_loader": "Llama-cpp Model Loader",
     "llama_cpp_instruct_adv": "Llama-cpp Instruct",
     "llama_cpp_parameters": "Llama-cpp Parameters",
+    "llama_cpp_skill_library": "Llama-cpp Skill Library",
+    "llama_cpp_mcp_config": "Llama-cpp MCP Config",
+    "llama_cpp_agent_instruct": "Llama-cpp Agent Instruct",
     "llama_cpp_unload_model": "Llama-cpp Unload Model",
     "llama_cpp_clean_states": "Llama-cpp Clean States",
     "parse_json_node": "Parse JSON",

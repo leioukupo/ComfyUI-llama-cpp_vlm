@@ -4,6 +4,8 @@ numpy
 pillow
 gguf
 tqdm
+mcp>=2,<3
+pyyaml
 
 # for Windows
 llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.46-cu130-win-20260808/llama_cpp_python-0.3.46+cu130-cp310-cp310-win_amd64.whl; python_version == "3.10" and platform_system == "Windows"

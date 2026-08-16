@@ -21,6 +21,33 @@ python -m pip install -r ComfyUI-llama-cpp/requirements.txt
 
 	> 在使用VLM模型进行图像推理之前, 请确保已经下载并选择了主模型对应的`mmproj`权重文件.
 
+## Agent、Skills 与 MCP
+
+需要让本地 llama.cpp 模型读取 skill 或调用 MCP 工具时，请使用 `Llama-cpp Agent Instruct`。可连接：
+
+- `Llama-cpp Skill Library`：读取本地 `SKILL.md` 目录，默认扫描本插件目录下的 `skills/`。
+- `Llama-cpp MCP Config`：配置 MCP server，支持 `mcpServers` / `servers` JSON，包含 stdio 与 Streamable HTTP。
+
+MCP 配置示例：
+
+```json
+{
+  "mcpServers": {
+    "demo": {
+      "command": "python3",
+      "args": ["server.py"],
+      "env": {}
+    },
+    "remote": {
+      "transport": "http",
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
+```
+
+工具调用默认自动执行；可在 MCP Config 节点中设置最大 agent 步数、工具超时和工具结果长度上限。
+
 ## 致谢
 - [llama-cpp-python](https://github.com/JamePeng/llama-cpp-python) @JamePeng  
 - [ComfyUI-llama-cpp](https://github.com/kijai/ComfyUI-llama-cpp) @kijai

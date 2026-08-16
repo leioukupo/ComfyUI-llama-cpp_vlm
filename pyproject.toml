@@ -20,7 +20,7 @@ classifiers = [
      "Environment :: GPU :: Apple Metal",    # Apple Metal support
 ]
 
-dependencies = ["diskcache", "scipy", "numpy", "pillow", "gguf"]
+dependencies = ["diskcache", "scipy", "numpy", "pillow", "gguf", "tqdm", "mcp>=2,<3", "pyyaml"]
 
 [project.urls]
 Repository = "https://github.com/lihaoyun6/ComfyUI-llama-cpp_vlm"
@@ -34,4 +34,3 @@ DisplayName = "ComfyUI-llama-cpp_vlm"
 Icon = ""
 includes = [] 
 # "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
-
