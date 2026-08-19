@@ -218,11 +218,19 @@ class LLAMA_CPP_STORAGE:
                 version = getattr(llama_cpp, "__version__", "unknown")
             module_path = getattr(llama_cpp, "__file__", "unknown")
             system = platform.system()
+            lib_dir = os.path.join(os.path.dirname(module_path), "lib") if module_path not in (None, "unknown") else ""
+            lib_names = os.listdir(lib_dir) if os.path.isdir(lib_dir) else []
+            has_cuda_backend = any("ggml-cuda" in name.lower() for name in lib_names)
+            has_metal_backend = any("ggml-metal" in name.lower() for name in lib_names)
             print(f"[llama-cpp_vlm] llama-cpp-python version = {version}")
             print(f"[llama-cpp_vlm] llama_cpp module = {module_path}")
-            if system in ["Linux", "Windows"] and "+cu" not in str(version).lower():
-                print("[llama-cpp_vlm] WARNING: This looks like a CPU llama-cpp-python wheel. Install the CUDA wheel from this node's requirements.txt/requirements_cu130.txt and restart ComfyUI.")
-            elif system == "Darwin" and "metal" not in str(version).lower():
+            if system in ["Linux", "Windows"]:
+                if "+cu" in str(version).lower() or has_cuda_backend:
+                    if has_cuda_backend:
+                        print("[llama-cpp_vlm] CUDA backend detected in llama_cpp lib directory.")
+                else:
+                    print("[llama-cpp_vlm] WARNING: This looks like a CPU llama-cpp-python wheel. Install the CUDA wheel from this node's requirements.txt/requirements_cu130.txt and restart ComfyUI.")
+            elif system == "Darwin" and "metal" not in str(version).lower() and not has_metal_backend:
                 print("[llama-cpp_vlm] NOTE: On macOS, make sure llama-cpp-python was installed with Metal support.")
             
         def get_chat_handler(chat_handler):
