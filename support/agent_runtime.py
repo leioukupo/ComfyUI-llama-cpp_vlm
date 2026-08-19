@@ -4,6 +4,7 @@ import json
 import re
 import threading
 from dataclasses import dataclass, field
+from html import unescape
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from .mcp_runtime import MCPCallResult, MCPRuntimeConfig, MCPToolbox
@@ -217,6 +218,56 @@ def _normalize_fallback_calls(data: Any, tool_names: Iterable[str]) -> List[Agen
     return calls
 
 
+def _parse_xml_parameter_value(value: str) -> Any:
+    value = unescape((value or "").strip())
+    if not value:
+        return ""
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def _extract_xml_tool_calls(text: str, tool_names: Iterable[str]) -> List[AgentToolCall]:
+    known = set(tool_names)
+    value = strip_thinking(text or "")
+    calls: List[AgentToolCall] = []
+    blocks = re.findall(r"<tool_call\b[^>]*>(.*?)</tool_call>", value, flags=re.DOTALL | re.IGNORECASE)
+
+    for index, block in enumerate(blocks, start=1):
+        fn_match = re.search(
+            r"<function\s*=\s*([A-Za-z0-9_.:-]+)\s*>(.*?)</function>",
+            block,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if fn_match:
+            name = fn_match.group(1).strip()
+            body = fn_match.group(2)
+        else:
+            name_match = re.search(r"<name\b[^>]*>(.*?)</name>", block, flags=re.DOTALL | re.IGNORECASE)
+            name = unescape(name_match.group(1).strip()) if name_match else ""
+            body = block
+
+        if name not in known:
+            continue
+
+        arguments: Dict[str, Any] = {}
+        args_match = re.search(r"<arguments\b[^>]*>(.*?)</arguments>", body, flags=re.DOTALL | re.IGNORECASE)
+        if args_match:
+            arguments = _parse_arguments(unescape(args_match.group(1).strip()))
+
+        for param_name, param_value in re.findall(
+            r"<parameter\s*=\s*([A-Za-z0-9_.:-]+)\s*>(.*?)</parameter>",
+            body,
+            flags=re.DOTALL | re.IGNORECASE,
+        ):
+            arguments[param_name.strip()] = _parse_xml_parameter_value(param_value)
+
+        calls.append(AgentToolCall(name=name, arguments=arguments, call_id=f"xml_{index}", source="fallback"))
+
+    return calls
+
+
 def extract_tool_calls(message: Dict[str, Any], tool_names: Iterable[str]) -> List[AgentToolCall]:
     calls: List[AgentToolCall] = []
 
@@ -252,15 +303,19 @@ def extract_tool_calls(message: Dict[str, Any], tool_names: Iterable[str]) -> Li
     if calls:
         return calls
 
-    data = _load_jsonish(str(message.get("content") or ""))
-    return _normalize_fallback_calls(data, tool_names)
+    content = str(message.get("content") or "")
+    data = _load_jsonish(content)
+    calls = _normalize_fallback_calls(data, tool_names)
+    if calls:
+        return calls
+    return _extract_xml_tool_calls(content, tool_names)
 
 
 def _tool_name(tool: Dict[str, Any]) -> str:
     return str(tool.get("function", {}).get("name") or "")
 
 
-def _format_tools_for_prompt(tools: List[Dict[str, Any]], max_chars: int = 8000) -> str:
+def _format_tools_for_prompt(tools: List[Dict[str, Any]], max_chars: int = 4000) -> str:
     compact = []
     for tool in tools:
         fn = tool.get("function", {})
@@ -279,6 +334,42 @@ def _format_tools_for_prompt(tools: List[Dict[str, Any]], max_chars: int = 8000)
 
 def _clone_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return json.loads(json.dumps(messages))
+
+
+def _llm_context_size(llm: Any) -> int:
+    for attr in ("n_ctx", "_n_ctx"):
+        value = getattr(llm, attr, None)
+        try:
+            value = value() if callable(value) else value
+            if value:
+                return int(value)
+        except Exception:
+            continue
+    return 8192
+
+
+def _default_skill_read_chars(n_ctx: int) -> int:
+    if n_ctx <= 8192:
+        return 4000
+    if n_ctx <= 16384:
+        return 8000
+    if n_ctx <= 32768:
+        return 16000
+    return 24000
+
+
+def _is_context_overflow_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "context shift" in text or ("n_ctx" in text and "context" in text)
+
+
+def _context_overflow_message(n_ctx: int) -> str:
+    return (
+        "Agent context exceeded the llama.cpp context window. "
+        f"Current n_ctx is {n_ctx}. Increase Llama-cpp Model Loader n_ctx "
+        "(32768 or 65536 is recommended for Qwen3.5 Agent workflows), "
+        "clear saved conversation state, or reduce Skill Library max_skill_chars / MCP max_tool_result_chars."
+    )
 
 
 class AgentRunner:
@@ -330,7 +421,14 @@ class AgentRunner:
             max_steps = max(1, self.mcp_config.max_agent_steps)
 
             for step in range(1, max_steps + 1):
-                completion = self._create_chat_completion(working_messages, tools)
+                try:
+                    completion = self._create_chat_completion(working_messages, tools)
+                except RuntimeError as exc:
+                    if not _is_context_overflow_error(exc):
+                        raise
+                    message = _context_overflow_message(_llm_context_size(self.llm))
+                    trace.append({"step": step, "error": message, "exception": str(exc)[:4000]})
+                    return AgentRunResult(output=message, trace=trace, selected_skills=selected_skills)
                 assistant_message = _message_from_completion(completion)
                 content = str(assistant_message.get("content") or "")
                 calls = extract_tool_calls(assistant_message, tool_names)
@@ -363,7 +461,13 @@ class AgentRunner:
                         )
                         trace.append(self._trace_tool_result(step, call, result))
                 else:
-                    working_messages.append({"role": "assistant", "content": content})
+                    fallback_call_summaries = [
+                        {"name": call.name, "arguments": call.arguments}
+                        for call in calls
+                    ]
+                    working_messages.append(
+                        {"role": "assistant", "content": "Requested tool calls:\n" + _json_dumps(fallback_call_summaries)}
+                    )
                     fallback_results = []
                     for call in calls:
                         result = self._execute_tool(call, tool_callbacks)
@@ -446,6 +550,12 @@ class AgentRunner:
         args = (arguments or {}).copy()
         if args.get("language") in (None, "", "auto"):
             args["language"] = language
+        if tool_name == "skill_read" and not args.get("max_chars"):
+            args["max_chars"] = min(
+                self.skill_library.max_skill_chars,
+                self.mcp_config.max_tool_result_chars,
+                _default_skill_read_chars(_llm_context_size(self.llm)),
+            )
         return self.skill_library.call_tool(tool_name, args)
 
     def _trace_tool_result(self, step: int, call: AgentToolCall, result: MCPCallResult) -> Dict[str, Any]:

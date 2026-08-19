@@ -291,15 +291,18 @@ class SkillLibrary:
             if language == "auto":
                 language = "en"
             query = str(arguments.get("query") or "").strip().lower()
+            query_terms = [term for term in re.split(r"[\s,;，；、]+", query) if term]
             summaries = self.list_summaries(language)
             if query:
-                summaries = [
-                    item
-                    for item in summaries
-                    if query in item["name"].lower()
-                    or query in item.get("display_name", "").lower()
-                    or query in item.get("description", "").lower()
-                ]
+                matched = []
+                for item in summaries:
+                    haystack = " ".join(
+                        str(item.get(key, "")).lower()
+                        for key in ("name", "display_name", "description")
+                    )
+                    if query in haystack or any(term in haystack for term in query_terms):
+                        matched.append(item)
+                summaries = matched
             return json.dumps({"skills": summaries}, ensure_ascii=False)
 
         if name == "skill_read":

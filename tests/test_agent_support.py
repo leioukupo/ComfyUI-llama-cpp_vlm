@@ -34,6 +34,9 @@ class TestSkillRuntime(unittest.TestCase):
             summaries = library.list_summaries("zh")
             self.assertEqual(summaries[0]["description"], "中文摘要")
 
+            filtered = json.loads(library.call_tool("skill_list", {"query": "战斗 中文", "language": "zh"}))
+            self.assertEqual(filtered["skills"][0]["name"], "writer")
+
             skill_payload = json.loads(library.read_skill("writer", language="zh"))
             self.assertEqual(skill_payload["path"], "SKILL.cn.md")
             self.assertIn("中文内容", skill_payload["content"])
@@ -145,6 +148,27 @@ class TestAgentRuntime(unittest.TestCase):
         self.assertEqual(calls[0].name, "skill_list")
         self.assertEqual(calls[0].arguments["query"], "h3")
 
+        xml_calls = extract_tool_calls(
+            {
+                "content": """为了查找技能：
+<tool_call>
+<function=skill_list>
+<parameter=query>
+战斗 动画 短片
+</parameter>
+<parameter=language>
+zh
+</parameter>
+</function>
+</tool_call>"""
+            },
+            ["skill_list"],
+        )
+        self.assertEqual(len(xml_calls), 1)
+        self.assertEqual(xml_calls[0].name, "skill_list")
+        self.assertEqual(xml_calls[0].arguments["query"], "战斗 动画 短片")
+        self.assertEqual(xml_calls[0].arguments["language"], "zh")
+
     def test_agent_fallback_loop_executes_skill_tool(self):
         with tempfile.TemporaryDirectory() as tmp:
             skill_dir = Path(tmp) / "demo"
@@ -182,6 +206,68 @@ class TestAgentRuntime(unittest.TestCase):
             self.assertEqual(result.output, "Final answer")
             self.assertEqual(result.selected_skills, ["demo"])
             self.assertTrue(any(event.get("tool") == "skill_list" for event in result.trace))
+
+    def test_agent_fallback_loop_executes_xml_skill_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = Path(tmp) / "demo"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: demo\ndescription: Battle animation skill.\n---\n# Demo\nUse the demo skill.",
+                encoding="utf-8",
+            )
+            library = scan_skill_directory(tmp)
+
+            class FakeLLM:
+                def __init__(self):
+                    self.calls = 0
+
+                def create_chat_completion(self, **kwargs):
+                    self.calls += 1
+                    if "tools" in kwargs:
+                        raise TypeError("tools are not supported")
+                    if self.calls == 2:
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": """<tool_call>
+<function=skill_list>
+<parameter=query>
+battle animation
+</parameter>
+</function>
+</tool_call>"""
+                                    }
+                                }
+                            ]
+                        }
+                    return {"choices": [{"message": {"content": "Final video prompt"}}]}
+
+            result = AgentRunner(FakeLLM(), seed=0, skill_library=library).run(
+                [{"role": "user", "content": "Make a battle animation."}]
+            )
+
+            self.assertEqual(result.output, "Final video prompt")
+            self.assertTrue(any(event.get("tool") == "skill_list" for event in result.trace))
+
+    def test_agent_context_overflow_returns_actionable_message(self):
+        class FakeLLM:
+            def n_ctx(self):
+                return 8192
+
+            def create_chat_completion(self, **kwargs):
+                raise RuntimeError(
+                    "Llama.eval: Context Shift is explicitly disabled by the C++ backend. "
+                    "You MUST increase n_ctx (currently 8192) to fit the dialogue."
+                )
+
+        result = AgentRunner(FakeLLM(), seed=0).run(
+            [{"role": "user", "content": "Use a long dialogue."}]
+        )
+
+        self.assertIn("Current n_ctx is 8192", result.output)
+        self.assertIn("Increase Llama-cpp Model Loader n_ctx", result.output)
+        self.assertTrue(result.trace[0].get("error"))
 
     def test_agent_auto_language_reads_chinese_skill(self):
         with tempfile.TemporaryDirectory() as tmp:

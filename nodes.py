@@ -486,9 +486,9 @@ class llama_cpp_model_loader:
             "mmproj": (mmproj_list, {"default": "None"}),
             "chat_handler": (chat_handlers, {"default": "None"}),
             "n_ctx": ("INT", {
-                "default": 8192,
+                "default": 32768,
                 "min": 1024, "max": 327680, "step": 128,
-                "tooltip": "Context length limit."
+                "tooltip": "Context length limit. Qwen3.5 Agent workflows usually need 32768 or higher."
             }),
             "vram_limit": ("INT", {
                 "default": -1,
@@ -823,7 +823,7 @@ class llama_cpp_skill_library:
                     "multiline": True,
                     "placeholder": "Optional skill names, one per line. Empty = all skills in the directory."
                 }),
-                "max_skill_chars": ("INT", {"default": 24000, "min": 1000, "max": 200000, "step": 1000}),
+                "max_skill_chars": ("INT", {"default": 12000, "min": 1000, "max": 200000, "step": 1000}),
                 "max_file_chars": ("INT", {"default": 20000, "min": 1000, "max": 200000, "step": 1000}),
             }
         }
@@ -874,7 +874,7 @@ class llama_cpp_mcp_config:
                     "tooltip": "Timeout for listing or calling MCP tools."
                 }),
                 "max_tool_result_chars": ("INT", {
-                    "default": 12000,
+                    "default": 8000,
                     "min": 256,
                     "max": 200000,
                     "step": 256,
