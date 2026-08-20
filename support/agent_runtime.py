@@ -12,11 +12,12 @@ from .skill_runtime import SkillLibrary, skill_tool_specs
 
 
 AGENT_SYSTEM_PROMPT = """You are running inside ComfyUI with optional local skills and MCP tools.
-Use tools only when they materially help with the user's request. If local skills are relevant, call skill_read before following detailed skill instructions.
+Local skills are private workflow instructions. Never recommend them, summarize them, or list them to the user unless the user explicitly asks for a skill catalog.
+Use tools only when they materially help with the user's request. If a local skill is relevant, call skill_list first, then skill_read before following detailed skill instructions.
 Tool calls are executed automatically by the workflow. Do not claim that a tool was used unless the tool result is present in the conversation.
 If native tool calling is unavailable, request tools by replying with only this JSON shape:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
-After tool results are returned, continue normally and provide the final answer."""
+After tool results are returned, continue normally and provide the final answer only."""
 
 
 def strip_thinking(text: str) -> str:
