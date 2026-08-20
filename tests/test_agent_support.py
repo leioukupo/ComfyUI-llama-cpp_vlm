@@ -1,13 +1,156 @@
 import asyncio
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 from support.agent_runtime import AgentRunner, extract_tool_calls, strip_thinking
+from support.auto_budget import normalize_n_ctx_for_chat_handler, resolve_auto_budget
 from support.mcp_runtime import MCPRuntimeConfig, MCPServerConfig, MCPToolbox, format_mcp_result, parse_mcp_config
 from support.skill_runtime import scan_skill_directory
+
+
+class TestAutoBudget(unittest.TestCase):
+    def _write_fake_gguf(self, path, size_gb=20):
+        metadata = {
+            "general.architecture": "qwen3",
+            "qwen3.block_count": 48,
+            "qwen3.attention.head_count": 32,
+            "qwen3.attention.head_count_kv": 8,
+            "qwen3.embedding_length": 4096,
+            "qwen3.attention.key_length": 128,
+            "qwen3.attention.value_length": 128,
+        }
+        with open(path, "wb") as f:
+            f.write(b"GGUF")
+            f.write(struct.pack("<I", 3))
+            f.write(struct.pack("<Q", 0))
+            f.write(struct.pack("<Q", len(metadata)))
+            for key, value in metadata.items():
+                key_bytes = key.encode("utf-8")
+                f.write(struct.pack("<Q", len(key_bytes)))
+                f.write(key_bytes)
+                if isinstance(value, str):
+                    value_bytes = value.encode("utf-8")
+                    f.write(struct.pack("<I", 8))
+                    f.write(struct.pack("<Q", len(value_bytes)))
+                    f.write(value_bytes)
+                else:
+                    f.write(struct.pack("<I", 4))
+                    f.write(struct.pack("<I", value))
+            f.truncate(size_gb * 1024 ** 3)
+
+    def test_qwen35_auto_budget_uses_large_context_and_keeps_retry_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "qwen.gguf"
+            mmproj = root / "mmproj.gguf"
+            self._write_fake_gguf(model, size_gb=20)
+            mmproj.write_bytes(b"x")
+            with open(mmproj, "ab") as f:
+                f.truncate(1024 ** 3)
+
+            plan = resolve_auto_budget(
+                model_path=str(model),
+                mmproj_path=str(mmproj),
+                chat_handler="Qwen3.5",
+                n_ctx=-1,
+                vram_limit=-1,
+                auto_max_ctx=65536,
+                is_qwen35_family=True,
+                cuda_memory=(23.0, 24.0),
+            )
+
+            self.assertTrue(plan.auto_n_ctx)
+            self.assertTrue(plan.auto_vram)
+            self.assertGreaterEqual(plan.n_ctx, 32768)
+            self.assertLessEqual(plan.n_ctx, 65536)
+            self.assertGreater(plan.n_gpu_layers, 0)
+            self.assertEqual(plan.attempts[0].n_ctx, plan.n_ctx)
+            self.assertEqual(plan.attempts[-1].n_ctx, 16384)
+
+    def test_auto_context_respects_node_max_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "qwen.gguf"
+            mmproj = root / "mmproj.gguf"
+            self._write_fake_gguf(model, size_gb=20)
+            mmproj.write_bytes(b"x")
+            with open(mmproj, "ab") as f:
+                f.truncate(1024 ** 3)
+
+            plan = resolve_auto_budget(
+                model_path=str(model),
+                mmproj_path=str(mmproj),
+                chat_handler="Qwen3.5",
+                n_ctx=-1,
+                vram_limit=-1,
+                auto_max_ctx=32768,
+                is_qwen35_family=True,
+                cuda_memory=(23.0, 24.0),
+            )
+
+            self.assertLessEqual(plan.n_ctx, 32768)
+
+    def test_manual_qwen35_values_are_clamped_to_safe_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "qwen.gguf"
+            mmproj = root / "mmproj.gguf"
+            self._write_fake_gguf(model, size_gb=20)
+            mmproj.write_bytes(b"x")
+            with open(mmproj, "ab") as f:
+                f.truncate(1024 ** 3)
+
+            plan = resolve_auto_budget(
+                model_path=str(model),
+                mmproj_path=str(mmproj),
+                chat_handler="Qwen3.5",
+                n_ctx=35967,
+                vram_limit=89,
+                auto_max_ctx=32768,
+                is_qwen35_family=True,
+                cuda_memory=(23.0, 24.0),
+            )
+
+            self.assertFalse(plan.auto_n_ctx)
+            self.assertFalse(plan.auto_vram)
+            self.assertLessEqual(plan.n_ctx, 32768)
+            self.assertGreater(plan.n_gpu_layers, 0)
+            self.assertEqual(plan.attempts[0].n_ctx, 32768)
+
+    def test_auto_context_honors_manual_vram_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "qwen.gguf"
+            mmproj = root / "mmproj.gguf"
+            self._write_fake_gguf(model, size_gb=20)
+            mmproj.write_bytes(b"x")
+            with open(mmproj, "ab") as f:
+                f.truncate(1024 ** 3)
+
+            plan = resolve_auto_budget(
+                model_path=str(model),
+                mmproj_path=str(mmproj),
+                chat_handler="Qwen3.5",
+                n_ctx=-1,
+                vram_limit=18,
+                auto_max_ctx=65536,
+                is_qwen35_family=True,
+                cuda_memory=(23.0, 24.0),
+            )
+
+            self.assertTrue(plan.auto_n_ctx)
+            self.assertFalse(plan.auto_vram)
+            self.assertLessEqual(plan.n_ctx, 65536)
+            self.assertGreater(plan.n_gpu_layers, 10)
+
+    def test_qwen35_manual_context_is_clamped_but_auto_sentinel_survives(self):
+        handlers = {"Qwen3.5"}
+        self.assertEqual(normalize_n_ctx_for_chat_handler("Qwen3.5", 8192, handlers), 16384)
+        self.assertEqual(normalize_n_ctx_for_chat_handler("Qwen3.5", -1, handlers), -1)
 
 
 class TestSkillRuntime(unittest.TestCase):

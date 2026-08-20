@@ -13,7 +13,10 @@ import numpy as np
 from PIL import Image, ImageDraw
 from scipy.ndimage import gaussian_filter
 from .support.cqdm import cqdm
-from .support.gguf_layers import get_layer_count
+from .support.auto_budget import (
+    is_context_creation_failure, normalize_n_ctx_for_chat_handler,
+    resolve_auto_budget,
+)
 from .support.prompt_enhancer_preset import *
 from .support.agent_runtime import AgentRunner, strip_thinking
 from .support.mcp_runtime import parse_mcp_config
@@ -120,6 +123,46 @@ try:
 except Exception:
     Step3VLChatHandler = None
 
+QWEN35_FAMILY_HANDLERS = {
+    "Qwen3.5",
+    "Qwen3.5-Thinking",
+    "Qwen3.6",
+    "Qwen3.6-Thinking",
+    "Qwen3.8",
+    "Qwen3.8-Thinking",
+}
+
+
+def _normalize_n_ctx_for_chat_handler(chat_handler: str, n_ctx: int) -> int:
+    return normalize_n_ctx_for_chat_handler(chat_handler, n_ctx, QWEN35_FAMILY_HANDLERS)
+
+
+def _cuda_memory_gb():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        free, total = torch.cuda.mem_get_info()
+        return free / (1024 ** 3), total / (1024 ** 3)
+    except Exception:
+        try:
+            total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            return total, total
+        except Exception:
+            return None
+
+
+def _fmt_gb(value):
+    if value is None:
+        return "unknown"
+    return f"{value:.1f} GB"
+
+
+def _fmt_gpu_layers(n_gpu_layers, gguf_layers):
+    if n_gpu_layers == -1:
+        return f"all/{gguf_layers}"
+    return f"{n_gpu_layers}/{gguf_layers}"
+
+
 class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
@@ -128,6 +171,7 @@ class LLAMA_CPP_STORAGE:
     llm = None
     chat_handler = None
     current_config = None
+    current_n_ctx = None
     current_embedding_mode = False
     messages = {}
     sys_prompts = {}
@@ -157,7 +201,7 @@ class LLAMA_CPP_STORAGE:
             
         # 2. 修改结构体中的 n_ctx 与 embeddings 状态
         if hasattr(params, "n_ctx"):
-            params.n_ctx = cls.current_config["n_ctx"]
+            params.n_ctx = cls.current_n_ctx or cls.current_config["n_ctx"]
             
         if hasattr(params, "embeddings"):
             params.embeddings = enable_embeddings
@@ -202,6 +246,7 @@ class LLAMA_CPP_STORAGE:
         cls.llm = None
         cls.chat_handler = None
         cls.current_config = None
+        cls.current_n_ctx = None
         cls.current_embedding_mode = False
         if all:
             cls.clean_state()
@@ -286,36 +331,53 @@ class LLAMA_CPP_STORAGE:
         
         cls.clean(all=True)
         check_llama_cpp_backend()
-        cls.current_config = config.copy()
         model = config["model"]
         mmproj = config["mmproj"]
         chat_handler = config["chat_handler"]
         n_ctx = config["n_ctx"]
+        auto_max_ctx = config.get("auto_max_ctx", 65536)
         vram_limit = config["vram_limit"]
         image_max_tokens = config["image_max_tokens"]
         image_min_tokens = config["image_min_tokens"]
         load_mtp = config["load_mtp"]
-        n_gpu_layers = -1
+        has_mmproj = bool(mmproj and mmproj != "None")
         
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
+        mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj) if has_mmproj else None
         handler_cls = get_chat_handler(chat_handler)
+        budget = resolve_auto_budget(
+            model_path=model_path,
+            mmproj_path=mmproj_path,
+            chat_handler=chat_handler,
+            n_ctx=n_ctx,
+            vram_limit=vram_limit,
+            auto_max_ctx=auto_max_ctx,
+            is_qwen35_family=chat_handler in QWEN35_FAMILY_HANDLERS,
+            cuda_memory=_cuda_memory_gb(),
+        )
+        n_ctx = budget.n_ctx
+        n_gpu_layers = budget.n_gpu_layers
         
-        if vram_limit != -1:
-            gguf_layers = get_layer_count(model_path) or 32
-            gguf_size = os.path.getsize(model_path) * 1.55 / (1024 ** 3)
-            gguf_layer_size = gguf_size / gguf_layers
+        if budget.auto_n_ctx or budget.auto_vram:
+            print(
+                "[llama-cpp_vlm] Auto budget: "
+                f"CUDA free={_fmt_gb(budget.free_gb)}, total={_fmt_gb(budget.total_gb)}, "
+                f"model_full~{budget.model_full_gpu_gb:.1f} GB, "
+                f"mmproj~{budget.mmproj_gpu_gb:.1f} GB, "
+                f"kv_gpu~{budget.kv_cache_gb:.1f} GB, overhead~{budget.overhead_gb:.1f} GB, "
+                f"auto_max_ctx={auto_max_ctx}."
+            )
+            print(
+                "[llama-cpp_vlm] Auto-selected "
+                f"n_ctx={n_ctx}, n_gpu_layers={_fmt_gpu_layers(n_gpu_layers, budget.gguf_layers)}."
+            )
         
-        if mmproj and mmproj != "None":
-            mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj)
+        if has_mmproj:
             if chat_handler == "None":
                 raise ValueError('"chat_handler" cannot be None when mmproj is used!')
             
             if handler_cls is None:
                 raise RuntimeError(f"Chat handler '{chat_handler}' is not available or failed to import.")
-
-            if vram_limit != -1:
-                mmproj_size = os.path.getsize(mmproj_path) * 1.55 / (1024 ** 3)
-                n_gpu_layers = max(1, int((vram_limit - mmproj_size) / gguf_layer_size))
             
             print(f"[llama-cpp_vlm] Loading clip: {mmproj}")
             
@@ -338,29 +400,65 @@ class LLAMA_CPP_STORAGE:
                 raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
 
         else:
-            if vram_limit != -1:
-                n_gpu_layers = max(1, int(vram_limit / gguf_layer_size))
             if handler_cls is not None:
                 cls.chat_handler = handler_cls(verbose=False)
             else:
                 cls.chat_handler = None
         
         print(f"[llama-cpp_vlm] Loading model: {model}")
-        print(f"[llama-cpp_vlm] n_gpu_layers = {n_gpu_layers}")
-        kwargs = {
+        llama_params = inspect.signature(Llama.__init__).parameters
+        base_kwargs = {
             "model_path": model_path,
             "chat_handler": cls.chat_handler,
-            "n_gpu_layers": n_gpu_layers,
-            "n_ctx": n_ctx,
             "verbose": False,
         }
-        if "load_mtp" in inspect.signature(Llama.__init__).parameters:
-            kwargs["load_mtp"] = load_mtp
+        if "load_mtp" in llama_params:
+            base_kwargs["load_mtp"] = load_mtp
         else:
             if load_mtp:
                 raise RuntimeError('"load_mtp" is unavailable! Please upgrade your llama-cpp-python.')
-            
-        cls.llm = Llama(**kwargs)
+        
+        def make_llama_kwargs(attempt):
+            kwargs = base_kwargs.copy()
+            kwargs["n_gpu_layers"] = attempt.n_gpu_layers
+            kwargs["n_ctx"] = attempt.n_ctx
+            if chat_handler in QWEN35_FAMILY_HANDLERS:
+                n_batch = min(attempt.n_ctx, 1024)
+                if "n_batch" in llama_params:
+                    kwargs["n_batch"] = n_batch
+                if "n_ubatch" in llama_params:
+                    kwargs["n_ubatch"] = min(n_batch, 512)
+            return kwargs
+
+        loaded_attempt = None
+        attempts = budget.attempts or tuple()
+        for index, attempt in enumerate(attempts):
+            if index > 0:
+                print(
+                    "[llama-cpp_vlm] Retrying with lower auto params: "
+                    f"n_ctx={attempt.n_ctx}, "
+                    f"n_gpu_layers={_fmt_gpu_layers(attempt.n_gpu_layers, budget.gguf_layers)}."
+                )
+            print(f"[llama-cpp_vlm] n_ctx = {attempt.n_ctx}")
+            print(f"[llama-cpp_vlm] n_gpu_layers = {attempt.n_gpu_layers}")
+            try:
+                cls.llm = Llama(**make_llama_kwargs(attempt))
+                loaded_attempt = attempt
+                break
+            except RuntimeError as e:
+                can_retry = (
+                    index < len(attempts) - 1
+                    and is_context_creation_failure(e)
+                )
+                if not can_retry:
+                    raise
+                print(f"[llama-cpp_vlm] Auto params failed to create context: {e}")
+                gc.collect()
+                mm.soft_empty_cache()
+        
+        if loaded_attempt is not None:
+            cls.current_config = config.copy()
+            cls.current_n_ctx = loaded_attempt.n_ctx
 
 any_type = AnyType("*")
 
@@ -486,14 +584,19 @@ class llama_cpp_model_loader:
             "mmproj": (mmproj_list, {"default": "None"}),
             "chat_handler": (chat_handlers, {"default": "None"}),
             "n_ctx": ("INT", {
-                "default": 32768,
-                "min": 1024, "max": 327680, "step": 128,
-                "tooltip": "Context length limit. Qwen3.5 Agent workflows usually need 32768 or higher."
+                "default": -1,
+                "min": -1, "max": 327680, "step": 128,
+                "tooltip": "Context length limit (-1 = auto). Qwen3.5 auto mode picks the largest practical context for current CUDA free VRAM."
+            }),
+            "auto_max_ctx": ("INT", {
+                "default": 65536,
+                "min": 4096, "max": 327680, "step": 4096,
+                "tooltip": "Upper bound used only when n_ctx is -1. Raise this to let auto mode try larger contexts."
             }),
             "vram_limit": ("INT", {
                 "default": -1,
                 "min": -1, "max": 1024, "step": 1,
-                "tooltip": "VRAM usage limit in GB (-1 = no limit)\nReference range; actual usage may slightly exceed."
+                "tooltip": "VRAM usage limit in GB (-1 = auto for Qwen3.5 family, no limit for other handlers).\nReference range; actual usage may slightly exceed."
             }),
             "image_min_tokens": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
             "image_max_tokens": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
@@ -506,12 +609,14 @@ class llama_cpp_model_loader:
     FUNCTION = "loadmodel"
     CATEGORY = "llama-cpp-vlm"
 
-    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens, image_max_tokens, load_mtp):
+    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens, image_max_tokens, load_mtp, auto_max_ctx=65536):
+        n_ctx = _normalize_n_ctx_for_chat_handler(chat_handler, n_ctx)
         custom_config = {
             "model": model,
             "mmproj": mmproj,
             "chat_handler": chat_handler,
             "n_ctx": n_ctx,
+            "auto_max_ctx": auto_max_ctx,
             "vram_limit": vram_limit,
             "image_min_tokens": image_min_tokens,
             "image_max_tokens": image_max_tokens,

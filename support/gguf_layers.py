@@ -78,7 +78,7 @@ def read_value_of_type(f, atype):
 
     raise ValueError(f"Unknown array item type {atype}")
 
-def get_layer_count(path):
+def read_metadata(path):
     with open(path, "rb") as f:
         if f.read(4) != b"GGUF":
             raise ValueError("This is not a GGUF file!")
@@ -92,7 +92,13 @@ def get_layer_count(path):
             key = read_string(f)
             value = read_value(f)
             meta[key] = value
-            
+
+    return meta
+
+
+def get_layer_count(path):
+    meta = read_metadata(path)
+
     for k, v in meta.items():
         if k.lower().endswith(".block_count"):
             return v
