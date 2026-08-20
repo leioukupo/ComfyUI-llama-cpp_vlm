@@ -401,6 +401,48 @@ zh
         self.assertEqual(result.pending_question, "请选择视频风格。")
         self.assertEqual(result.trace[-1]["source"], "fallback")
 
+    def test_agent_falls_back_when_native_tools_break_chat_template(self):
+        class UndefinedError(Exception):
+            pass
+
+        class FakeLLM:
+            def __init__(self):
+                self.calls = []
+
+            def create_chat_completion(self, **kwargs):
+                self.calls.append("tools" in kwargs)
+                if "tools" in kwargs:
+                    raise UndefinedError("'raise_exception' is undefined")
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "tool_calls": [
+                                            {
+                                                "name": "ask_user",
+                                                "arguments": {"question": "你希望哪种风格？"},
+                                            }
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        fake_llm = FakeLLM()
+        result = AgentRunner(fake_llm, seed=0).run(
+            [{"role": "user", "content": "小男孩和怪兽战斗"}]
+        )
+
+        self.assertEqual(fake_llm.calls, [True, False])
+        self.assertEqual(result.status, STATUS_AWAITING_USER)
+        self.assertEqual(result.pending_question, "你希望哪种风格？")
+        self.assertEqual(result.trace[-1]["source"], "fallback")
+
     def test_agent_xml_fallback_ask_user_enters_awaiting_state(self):
         class FakeLLM:
             def create_chat_completion(self, **kwargs):

@@ -512,6 +512,16 @@ def _is_context_overflow_error(exc: BaseException) -> bool:
     return "context shift" in text or ("n_ctx" in text and "context" in text)
 
 
+def _is_native_tool_template_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    exc_name = type(exc).__name__.lower()
+    return (
+        ("raise_exception" in text and "undefined" in text)
+        or ("undefinederror" in exc_name and "tool" in text)
+        or ("chat template" in text and "tool" in text)
+    )
+
+
 def _context_overflow_message(n_ctx: int) -> str:
     return (
         "Agent context exceeded the llama.cpp context window. "
@@ -739,6 +749,10 @@ class AgentRunner:
                 )
             except TypeError as exc:
                 if "tool" not in str(exc):
+                    raise
+                self.native_tools_supported = False
+            except Exception as exc:
+                if not _is_native_tool_template_error(exc):
                     raise
                 self.native_tools_supported = False
 
