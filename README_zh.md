@@ -27,6 +27,7 @@ python -m pip install -r ComfyUI-llama-cpp/requirements.txt
 
 - `Llama-cpp Agent Instruct`：保留原有 one-by-one / images / video 批处理习惯，适合一次 workflow 内完成图像、视频或文本任务。
 - `Llama-cpp Agent Chat`：用于真正多轮对话。把上一轮输出的 `session` 接回下一轮的 `session` 输入，或保持同一个 `state_uid`，即可跨多次 ComfyUI 运行续聊。模型需要追问时会返回 `status=awaiting_user`，问题显示在 `ai_question`，把回答写入 `user_answer` 后重新 Queue 即可继续。
+- `Llama-cpp Live Chat`：一次 Queue 后保持节点活着，直接在节点里继续发消息，点 `End` 才让工作流继续往下走。
 
 - `Llama-cpp Skill Library`：读取本地 `SKILL.md` 目录，默认扫描本插件目录下的 `skills/`。
 - `Llama-cpp MCP Config`：配置 MCP server，支持 `mcpServers` / `servers` JSON，包含 stdio 与 Streamable HTTP。

@@ -522,6 +522,54 @@ def _is_native_tool_template_error(exc: BaseException) -> bool:
     )
 
 
+def _template_raise_exception(message: str) -> None:
+    raise ValueError(message)
+
+
+def patch_llama_template_compatibility(target: Any) -> None:
+    if target is None:
+        return
+
+    visited: set[int] = set()
+
+    def _patch(obj: Any) -> None:
+        if obj is None:
+            return
+        marker = id(obj)
+        if marker in visited:
+            return
+        visited.add(marker)
+
+        extra = getattr(obj, "extra_template_arguments", None)
+        if not isinstance(extra, dict):
+            extra = {}
+        extra.setdefault("raise_exception", _template_raise_exception)
+        if hasattr(obj, "add_generation_prompt"):
+            extra.setdefault("add_generation_prompt", getattr(obj, "add_generation_prompt"))
+        try:
+            setattr(obj, "extra_template_arguments", extra)
+        except Exception:
+            pass
+
+        chat_template = getattr(obj, "chat_template", None)
+        if chat_template is not None:
+            try:
+                env = getattr(chat_template, "environment", None) or getattr(chat_template, "_environment", None)
+                if env is not None and hasattr(env, "globals"):
+                    env.globals.setdefault("raise_exception", _template_raise_exception)
+                    if hasattr(obj, "add_generation_prompt"):
+                        env.globals.setdefault("add_generation_prompt", getattr(obj, "add_generation_prompt"))
+            except Exception:
+                pass
+
+        for attr_name in ("chat_handler", "_chat_handler"):
+            nested = getattr(obj, attr_name, None)
+            if nested is not None and nested is not obj:
+                _patch(nested)
+
+    _patch(target)
+
+
 def _context_overflow_message(n_ctx: int) -> str:
     return (
         "Agent context exceeded the llama.cpp context window. "
@@ -738,6 +786,7 @@ class AgentRunner:
 
     def _create_chat_completion(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         kwargs = self.parameters.copy()
+        patch_llama_template_compatibility(self.llm)
         if tools and self.native_tools_supported:
             try:
                 return self.llm.create_chat_completion(

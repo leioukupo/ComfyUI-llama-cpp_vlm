@@ -27,6 +27,7 @@ Use the Agent nodes when you want the local llama.cpp model to read local skills
 
 - `Llama-cpp Agent Instruct` keeps the existing one-by-one / images / video batch workflow for one workflow run.
 - `Llama-cpp Agent Chat` is for real multi-turn chat. Feed its `session` output back into the next run's `session` input, or keep the same `state_uid`, to continue across ComfyUI runs. When the model needs clarification it returns `status=awaiting_user`, shows the question in `ai_question`, and continues after you fill `user_answer` and queue again.
+- `Llama-cpp Live Chat` keeps one workflow run alive for a blocking, button-driven chat session. Queue once, keep sending messages from the node, and click `End` when you want the workflow to continue.
 
 - `Llama-cpp Skill Library` for local `SKILL.md` folders. By default it scans this custom node's `skills/` directory.
 - `Llama-cpp MCP Config` for MCP servers. It accepts `mcpServers` / `servers` JSON with stdio or Streamable HTTP entries.

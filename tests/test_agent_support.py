@@ -14,6 +14,7 @@ from support.agent_runtime import (
     extract_tool_calls,
     looks_like_user_question,
     normalize_session,
+    patch_llama_template_compatibility,
     strip_thinking,
 )
 from support.auto_budget import normalize_n_ctx_for_chat_handler, resolve_auto_budget
@@ -479,6 +480,29 @@ zh
         self.assertTrue(looks_like_user_question("你希望哪种风格？"))
         self.assertTrue(looks_like_user_question("Which style would you like?"))
         self.assertFalse(looks_like_user_question("Here is the final prompt for a 15 second video."))
+
+    def test_patch_llama_template_compatibility_injects_raise_exception(self):
+        class FakeEnv:
+            def __init__(self):
+                self.globals = {}
+
+        class FakeTemplate:
+            def __init__(self):
+                self.environment = FakeEnv()
+
+        class FakeHandler:
+            def __init__(self):
+                self.chat_template = FakeTemplate()
+                self.extra_template_arguments = {}
+                self.add_generation_prompt = True
+
+        handler = FakeHandler()
+        patch_llama_template_compatibility(handler)
+
+        self.assertIn("raise_exception", handler.extra_template_arguments)
+        self.assertTrue(callable(handler.extra_template_arguments["raise_exception"]))
+        self.assertIn("raise_exception", handler.chat_template.environment.globals)
+        self.assertIn("add_generation_prompt", handler.extra_template_arguments)
 
     def test_agent_fallback_loop_executes_skill_tool(self):
         with tempfile.TemporaryDirectory() as tmp:

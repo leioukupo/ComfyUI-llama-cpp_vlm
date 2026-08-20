@@ -27,7 +27,19 @@ from .support.agent_runtime import (
     build_session_signature,
     looks_like_user_question,
     normalize_session,
+    patch_llama_template_compatibility,
     strip_thinking,
+)
+from .support.live_chat_runtime import (
+    LiveChatManager,
+    STATUS_ENDED as LIVE_STATUS_ENDED,
+    STATUS_ERROR as LIVE_STATUS_ERROR,
+    STATUS_RUNNING as LIVE_STATUS_RUNNING,
+    STATUS_STOPPING as LIVE_STATUS_STOPPING,
+    STATUS_WAITING as LIVE_STATUS_WAITING,
+    build_live_session_signature,
+    render_transcript as render_live_transcript,
+    run_live_chat,
 )
 from .support.mcp_runtime import parse_mcp_config
 from .support.skill_runtime import scan_skill_directory
@@ -280,6 +292,10 @@ class LLAMA_CPP_STORAGE:
         cls.current_config = None
         cls.current_n_ctx = None
         cls.current_embedding_mode = False
+        try:
+            LIVE_CHAT_MANAGER.clear()
+        except Exception:
+            pass
         if all:
             cls.clean_state()
         
@@ -430,12 +446,14 @@ class LLAMA_CPP_STORAGE:
                 cls.chat_handler = handler_cls(**kwargs)
             except Exception as e:
                 raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
+            patch_llama_template_compatibility(cls.chat_handler)
 
         else:
             if handler_cls is not None:
                 cls.chat_handler = handler_cls(verbose=False)
             else:
                 cls.chat_handler = None
+            patch_llama_template_compatibility(cls.chat_handler)
         
         print(f"[llama-cpp_vlm] Loading model: {model}")
         llama_params = inspect.signature(Llama.__init__).parameters
@@ -475,6 +493,7 @@ class LLAMA_CPP_STORAGE:
             print(f"[llama-cpp_vlm] n_gpu_layers = {attempt.n_gpu_layers}")
             try:
                 cls.llm = Llama(**make_llama_kwargs(attempt))
+                patch_llama_template_compatibility(cls.llm)
                 loaded_attempt = attempt
                 break
             except RuntimeError as e:
@@ -491,6 +510,8 @@ class LLAMA_CPP_STORAGE:
         if loaded_attempt is not None:
             cls.current_config = config.copy()
             cls.current_n_ctx = loaded_attempt.n_ctx
+
+LIVE_CHAT_MANAGER = LiveChatManager()
 
 any_type = AnyType("*")
 
@@ -644,6 +665,81 @@ def _coerce_session(session, uid, signature):
     session.state_uid = uid
     session.signature = signature
     return session
+
+
+_LIVE_CHAT_ROUTES_REGISTERED = False
+
+
+def _emit_live_chat_state(session, event):
+    try:
+        from server import PromptServer
+    except Exception:
+        return
+
+    payload = session.snapshot()
+    payload["event"] = event
+    try:
+        PromptServer.instance.send_sync("llama_cpp_vlm.live_chat_state", payload)
+    except Exception:
+        pass
+
+
+def _register_live_chat_routes():
+    global _LIVE_CHAT_ROUTES_REGISTERED
+    if _LIVE_CHAT_ROUTES_REGISTERED:
+        return
+
+    try:
+        from aiohttp import web
+        from server import PromptServer
+    except Exception:
+        return
+
+    if getattr(PromptServer.instance, "_llama_cpp_vlm_live_routes_registered", False):
+        _LIVE_CHAT_ROUTES_REGISTERED = True
+        return
+
+    routes = PromptServer.instance.routes
+
+    @routes.get("/llama_cpp_vlm/live_chat/state")
+    async def _live_chat_state(request):
+        state_uid = str(request.rel_url.query.get("state_uid") or "")
+        node_id = str(request.rel_url.query.get("node_id") or "")
+        session = LIVE_CHAT_MANAGER.get(state_uid=state_uid or None, node_id=node_id or None)
+        if session is None:
+            return web.json_response({"ok": False, "error": "session not found"}, status=404)
+        return web.json_response({"ok": True, "session": session.snapshot()})
+
+    @routes.post("/llama_cpp_vlm/live_chat/send")
+    async def _live_chat_send(request):
+        data = await request.post()
+        state_uid = str(data.get("state_uid") or "")
+        node_id = str(data.get("node_id") or "")
+        message = str(data.get("message") or "")
+        session = LIVE_CHAT_MANAGER.get(state_uid=state_uid or None, node_id=node_id or None)
+        if session is None:
+            return web.json_response({"ok": False, "error": "session not found"}, status=404)
+        if not session.queue_user_message(message):
+            return web.json_response({"ok": False, "error": "session is not accepting messages"}, status=409)
+        _emit_live_chat_state(session, "queued")
+        return web.json_response({"ok": True, "session": session.snapshot()})
+
+    @routes.post("/llama_cpp_vlm/live_chat/end")
+    async def _live_chat_end(request):
+        data = await request.post()
+        state_uid = str(data.get("state_uid") or "")
+        node_id = str(data.get("node_id") or "")
+        session = LIVE_CHAT_MANAGER.end_session(state_uid=state_uid or None, node_id=node_id or None)
+        if session is None:
+            return web.json_response({"ok": False, "error": "session not found"}, status=404)
+        _emit_live_chat_state(session, "stopping")
+        return web.json_response({"ok": True, "session": session.snapshot()})
+
+    _LIVE_CHAT_ROUTES_REGISTERED = True
+    PromptServer.instance._llama_cpp_vlm_live_routes_registered = True
+
+
+_register_live_chat_routes()
 
 class llama_cpp_model_loader:
     @classmethod
@@ -1541,6 +1637,125 @@ class llama_cpp_agent_chat:
             pending_question if status == STATUS_AWAITING_USER else "",
         )
 
+
+class llama_cpp_live_chat:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "llama_model": ("LLAMACPPMODEL",),
+                "user_message": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Type the first message before Queue, or type a reply and click Send while the session is live.",
+                }),
+                "conversation_log": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Live transcript will appear here.",
+                }),
+                "live_status": ("STRING", {
+                    "default": "idle",
+                    "multiline": False,
+                }),
+                "system_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
+                "force_offload": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Unload the model after the live chat ends.",
+                }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
+            "optional": {
+                "parameters": ("LLAMACPPARAMS",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "LLAMACPPSESSION", "STRING")
+    RETURN_NAMES = ("output", "conversation_log", "state_uid", "session", "status")
+    OUTPUT_IS_LIST = (False, False, False, False, False)
+    FUNCTION = "process"
+    CATEGORY = "llama-cpp-vlm/agent"
+
+    def process(self, llama_model, user_message, conversation_log, live_status, system_prompt, seed, force_offload, unique_id, parameters=None):
+        llama_model = _unwrap_list_value(llama_model)
+        user_message = str(_unwrap_list_value(user_message) or "")
+        conversation_log = str(_unwrap_list_value(conversation_log) or "")
+        live_status = str(_unwrap_list_value(live_status) or "")
+        system_prompt = str(_unwrap_list_value(system_prompt) or "")
+        seed = _unwrap_list_value(seed)
+        force_offload = _unwrap_list_value(force_offload)
+        unique_id = _unwrap_list_value(unique_id)
+        parameters = _unwrap_list_value(parameters)
+
+        if parameters is None:
+            parameters = {}
+
+        _parameters = parameters.copy()
+        if _MTMD:
+            _parameters.pop("present_penalty", None)
+
+        uid = str(unique_id).rpartition(".")[-1]
+        signature = build_live_session_signature(llama_model, system_prompt, {"seed": seed, **_parameters})
+
+        if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != llama_model:
+            print("[llama-cpp_vlm] Loading model...")
+            LLAMA_CPP_STORAGE.load_model(llama_model)
+
+        LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
+
+        session = LIVE_CHAT_MANAGER.open_session(uid, uid, signature, system_prompt)
+        session.status = LIVE_STATUS_RUNNING if user_message.strip() else LIVE_STATUS_WAITING
+        _emit_live_chat_state(session, "opened")
+
+        try:
+            live_session = run_live_chat(
+                LIVE_CHAT_MANAGER,
+                LLAMA_CPP_STORAGE.llm,
+                seed,
+                _parameters,
+                session,
+                mm.processing_interrupted,
+                _emit_live_chat_state,
+                user_message,
+            )
+        except Exception as exc:
+            session.status = LIVE_STATUS_ERROR
+            session.error = f"Live chat failed: {exc}"
+            _emit_live_chat_state(session, "error")
+            live_session = session
+
+        output = live_session.error if live_session.status == LIVE_STATUS_ERROR and live_session.error else live_session.last_output
+        transcript = render_live_transcript(live_session.messages)
+        final_status = STATUS_ERROR if live_session.status == LIVE_STATUS_ERROR else STATUS_COMPLETE
+
+        final_session = ConversationSession(
+            state_uid=uid,
+            signature=signature,
+            messages=json.loads(json.dumps(live_session.messages)),
+            turn_count=live_session.turn_count,
+            last_output=output,
+            status=final_status,
+        )
+
+        if force_offload:
+            LLAMA_CPP_STORAGE.clean()
+        else:
+            if LLAMA_CPP_STORAGE.llm is not None:
+                try:
+                    LLAMA_CPP_STORAGE.llm.n_tokens = 0
+                    if hasattr(LLAMA_CPP_STORAGE.llm, "_ctx") and LLAMA_CPP_STORAGE.llm._ctx is not None:
+                        LLAMA_CPP_STORAGE.llm._ctx.memory_clear(True)
+                    if getattr(LLAMA_CPP_STORAGE.llm, "is_hybrid", False) and LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr is not None:
+                        LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr.clear()
+                except Exception:
+                    pass
+
+        gc.collect()
+        return (output, transcript, uid, final_session, live_session.status)
+
 class llama_cpp_clean_states:
     @classmethod
     def INPUT_TYPES(s):
@@ -2286,6 +2501,7 @@ NODE_CLASS_MAPPINGS = {
     "llama_cpp_mcp_config": llama_cpp_mcp_config,
     "llama_cpp_agent_instruct": llama_cpp_agent_instruct,
     "llama_cpp_agent_chat": llama_cpp_agent_chat,
+    "llama_cpp_live_chat": llama_cpp_live_chat,
     "llama_cpp_unload_model": llama_cpp_unload_model,
     "llama_cpp_clean_states": llama_cpp_clean_states,
     "parse_json_node": parse_json_node,
@@ -2306,6 +2522,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "llama_cpp_mcp_config": "Llama-cpp MCP Config",
     "llama_cpp_agent_instruct": "Llama-cpp Agent Instruct",
     "llama_cpp_agent_chat": "Llama-cpp Agent Chat",
+    "llama_cpp_live_chat": "Llama-cpp Live Chat",
     "llama_cpp_unload_model": "Llama-cpp Unload Model",
     "llama_cpp_clean_states": "Llama-cpp Clean States",
     "parse_json_node": "Parse JSON",
