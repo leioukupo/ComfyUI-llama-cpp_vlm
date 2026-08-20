@@ -18,7 +18,17 @@ from .support.auto_budget import (
     resolve_auto_budget,
 )
 from .support.prompt_enhancer_preset import *
-from .support.agent_runtime import AgentRunner, ConversationSession, build_session_signature, normalize_session, strip_thinking
+from .support.agent_runtime import (
+    AgentRunner,
+    ConversationSession,
+    STATUS_AWAITING_USER,
+    STATUS_COMPLETE,
+    STATUS_ERROR,
+    build_session_signature,
+    looks_like_user_question,
+    normalize_session,
+    strip_thinking,
+)
 from .support.mcp_runtime import parse_mcp_config
 from .support.skill_runtime import scan_skill_directory
 
@@ -1315,7 +1325,17 @@ class llama_cpp_agent_chat:
                 "user_prompt": ("STRING", {
                     "default": "",
                     "multiline": True,
-                    "placeholder": "Ask the model to continue the conversation."
+                    "placeholder": "Initial task or new user message."
+                }),
+                "ai_question": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "AI question will appear here when status is awaiting_user."
+                }),
+                "user_answer": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Answer the AI question here, then queue again."
                 }),
                 "system_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
@@ -1335,15 +1355,40 @@ class llama_cpp_agent_chat:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING", "LLAMACPPSESSION")
-    RETURN_NAMES = ("output", "output_list", "state_uid", "tool_trace", "selected_skills", "session")
-    OUTPUT_IS_LIST = (False, True, False, False, False, False)
+    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING", "LLAMACPPSESSION", "STRING", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("output", "output_list", "state_uid", "tool_trace", "selected_skills", "session", "status", "ai_question", "awaiting_user")
+    OUTPUT_IS_LIST = (False, True, False, False, False, False, False, False, False)
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm/agent"
 
-    def process(self, llama_model, user_prompt, system_prompt, seed, force_offload, unique_id, parameters=None, session=None, skills=None, mcp_config=None):
+    def _return_chat(self, output, uid, trace, selected_skills, session, status, ai_question):
+        awaiting_user = status == STATUS_AWAITING_USER
+        payload = (
+            output,
+            [output],
+            uid,
+            json.dumps(trace, ensure_ascii=False, indent=2),
+            json.dumps(selected_skills, ensure_ascii=False),
+            session,
+            status,
+            ai_question,
+            awaiting_user,
+        )
+        return {
+            "ui": {
+                "status": [status],
+                "ai_question": [ai_question],
+                "awaiting_user": [awaiting_user],
+                "output": [output],
+            },
+            "result": payload,
+        }
+
+    def process(self, llama_model, user_prompt, ai_question, user_answer, system_prompt, seed, force_offload, unique_id, parameters=None, session=None, skills=None, mcp_config=None):
         llama_model = _unwrap_list_value(llama_model)
         user_prompt = str(_unwrap_list_value(user_prompt) or "")
+        ai_question = str(_unwrap_list_value(ai_question) or "")
+        user_answer = str(_unwrap_list_value(user_answer) or "")
         system_prompt = str(_unwrap_list_value(system_prompt) or "")
         seed = _unwrap_list_value(seed)
         force_offload = _unwrap_list_value(force_offload)
@@ -1352,12 +1397,6 @@ class llama_cpp_agent_chat:
         session = _unwrap_list_value(session)
         skills = _unwrap_list_value(skills)
         mcp_config = _unwrap_list_value(mcp_config)
-
-        if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != llama_model:
-            print("[llama-cpp_vlm] Loading model...")
-            LLAMA_CPP_STORAGE.load_model(llama_model)
-
-        LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
 
         if parameters is None:
             parameters = {}
@@ -1379,11 +1418,55 @@ class llama_cpp_agent_chat:
                 if message.get("role") != "system"
             ]
 
+        if base_session.status == STATUS_AWAITING_USER and not user_answer.strip():
+            pending_question = base_session.pending_question or ai_question
+            LLAMA_CPP_STORAGE.set_session(uid, base_session)
+            return self._return_chat(
+                "",
+                uid,
+                [{"status": STATUS_AWAITING_USER, "question": pending_question, "branch": "waiting"}],
+                [],
+                base_session,
+                STATUS_AWAITING_USER,
+                pending_question,
+            )
+
+        if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != llama_model:
+            print("[llama-cpp_vlm] Loading model...")
+            LLAMA_CPP_STORAGE.load_model(llama_model)
+
+        LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
+
         messages = []
         if system_prompt.strip():
             messages.append({"role": "system", "content": system_prompt})
         messages.extend(history)
-        messages.append({"role": "user", "content": user_prompt})
+
+        if base_session.status == STATUS_AWAITING_USER:
+            next_user_message = user_answer.strip()
+        else:
+            next_user_message = user_prompt.strip() or user_answer.strip()
+
+        if not next_user_message:
+            empty_session = ConversationSession(
+                state_uid=uid,
+                signature=signature,
+                messages=history,
+                turn_count=base_session.turn_count,
+                last_output="",
+                status=STATUS_ERROR,
+            )
+            return self._return_chat(
+                "",
+                uid,
+                [{"status": STATUS_ERROR, "error": "user_prompt is empty.", "branch": "input"}],
+                [],
+                empty_session,
+                STATUS_ERROR,
+                "",
+            )
+
+        messages.append({"role": "user", "content": next_user_message})
 
         runner = AgentRunner(
             LLAMA_CPP_STORAGE.llm,
@@ -1393,7 +1476,33 @@ class llama_cpp_agent_chat:
             mcp_config=mcp_config,
         )
         result = runner.run(messages)
-        out1 = strip_thinking(result.output)
+        raw_output = strip_thinking(result.output)
+        status = result.status or STATUS_COMPLETE
+        pending_question = result.pending_question or ""
+        pending_fields = result.pending_fields
+        pending_question_id = result.pending_question_id
+        tool_trace = result.trace
+
+        if status == STATUS_COMPLETE and looks_like_user_question(raw_output):
+            status = STATUS_AWAITING_USER
+            pending_question = raw_output
+            pending_fields = []
+            pending_question_id = build_session_signature({"question": pending_question, "uid": uid})[:16]
+            tool_trace.append(
+                {
+                    "step": len(tool_trace) + 1,
+                    "branch": "clarification_fallback",
+                    "tool": "ask_user",
+                    "tool_kind": "clarification",
+                    "tool_provider": "agent",
+                    "source": "natural_language",
+                    "arguments": {"question": pending_question},
+                    "is_error": False,
+                    "content": pending_question[:4000],
+                }
+            )
+
+        out1 = "" if status == STATUS_AWAITING_USER else raw_output
 
         updated_session = ConversationSession(
             state_uid=uid,
@@ -1401,10 +1510,13 @@ class llama_cpp_agent_chat:
             messages=result.transcript,
             turn_count=base_session.turn_count + 1,
             last_output=out1,
+            status=status,
+            pending_question=pending_question if status == STATUS_AWAITING_USER else "",
+            pending_fields=pending_fields if status == STATUS_AWAITING_USER else [],
+            pending_question_id=pending_question_id if status == STATUS_AWAITING_USER else "",
         )
         LLAMA_CPP_STORAGE.set_session(uid, updated_session)
 
-        tool_trace = result.trace
         selected_skill_names = result.selected_skills
 
         if force_offload:
@@ -1419,13 +1531,14 @@ class llama_cpp_agent_chat:
                     LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr.clear()
 
         gc.collect()
-        return (
+        return self._return_chat(
             out1,
-            [out1],
             uid,
-            json.dumps(tool_trace, ensure_ascii=False, indent=2),
-            json.dumps(selected_skill_names, ensure_ascii=False),
+            tool_trace,
+            selected_skill_names,
             updated_session,
+            status,
+            pending_question if status == STATUS_AWAITING_USER else "",
         )
 
 class llama_cpp_clean_states:

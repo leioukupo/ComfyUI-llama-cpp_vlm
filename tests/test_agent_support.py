@@ -6,7 +6,16 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from support.agent_runtime import AgentRunner, ConversationSession, build_session_signature, extract_tool_calls, normalize_session, strip_thinking
+from support.agent_runtime import (
+    AgentRunner,
+    ConversationSession,
+    STATUS_AWAITING_USER,
+    build_session_signature,
+    extract_tool_calls,
+    looks_like_user_question,
+    normalize_session,
+    strip_thinking,
+)
 from support.auto_budget import normalize_n_ctx_for_chat_handler, resolve_auto_budget
 from support.mcp_runtime import MCPRuntimeConfig, MCPServerConfig, MCPToolbox, format_mcp_result, parse_mcp_config
 from support.skill_runtime import scan_skill_directory
@@ -312,6 +321,123 @@ zh
         self.assertEqual(xml_calls[0].arguments["query"], "战斗 动画 短片")
         self.assertEqual(xml_calls[0].arguments["language"], "zh")
 
+    def test_agent_native_ask_user_enters_awaiting_state(self):
+        class FakeLLM:
+            def create_chat_completion(self, **kwargs):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_question",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "ask_user",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "question": "你希望哪种风格？",
+                                                    "fields": ["style", "duration"],
+                                                },
+                                                ensure_ascii=False,
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+
+        result = AgentRunner(FakeLLM(), seed=0).run(
+            [{"role": "user", "content": "小男孩和怪兽战斗"}]
+        )
+
+        self.assertEqual(result.status, STATUS_AWAITING_USER)
+        self.assertEqual(result.output, "你希望哪种风格？")
+        self.assertEqual(result.pending_question, "你希望哪种风格？")
+        self.assertEqual(result.pending_fields, ["style", "duration"])
+        self.assertTrue(result.pending_question_id)
+        self.assertEqual(result.trace[-1]["tool_kind"], "clarification")
+        self.assertEqual(result.trace[-1]["source"], "native")
+        self.assertEqual(result.transcript[-1]["content"], "你希望哪种风格？")
+
+    def test_agent_json_fallback_ask_user_enters_awaiting_state(self):
+        class FakeLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def create_chat_completion(self, **kwargs):
+                self.calls += 1
+                if "tools" in kwargs:
+                    raise TypeError("tools are not supported")
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "tool_calls": [
+                                            {
+                                                "name": "ask_user",
+                                                "arguments": {"question": "请选择视频风格。"},
+                                            }
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        result = AgentRunner(FakeLLM(), seed=0).run(
+            [{"role": "user", "content": "小男孩和怪兽战斗"}]
+        )
+
+        self.assertEqual(result.status, STATUS_AWAITING_USER)
+        self.assertEqual(result.pending_question, "请选择视频风格。")
+        self.assertEqual(result.trace[-1]["source"], "fallback")
+
+    def test_agent_xml_fallback_ask_user_enters_awaiting_state(self):
+        class FakeLLM:
+            def create_chat_completion(self, **kwargs):
+                if "tools" in kwargs:
+                    raise TypeError("tools are not supported")
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": """<tool_call>
+<function=ask_user>
+<parameter=question>
+你希望哪种风格？
+</parameter>
+<parameter=fields>
+["style"]
+</parameter>
+</function>
+</tool_call>"""
+                            }
+                        }
+                    ]
+                }
+
+        result = AgentRunner(FakeLLM(), seed=0).run(
+            [{"role": "user", "content": "小男孩和怪兽战斗"}]
+        )
+
+        self.assertEqual(result.status, STATUS_AWAITING_USER)
+        self.assertEqual(result.pending_question, "你希望哪种风格？")
+        self.assertEqual(result.pending_fields, ["style"])
+
+    def test_natural_language_question_detection(self):
+        self.assertTrue(looks_like_user_question("你希望哪种风格？"))
+        self.assertTrue(looks_like_user_question("Which style would you like?"))
+        self.assertFalse(looks_like_user_question("Here is the final prompt for a 15 second video."))
+
     def test_agent_fallback_loop_executes_skill_tool(self):
         with tempfile.TemporaryDirectory() as tmp:
             skill_dir = Path(tmp) / "demo"
@@ -551,6 +677,10 @@ battle animation
             messages=[{"role": "user", "content": "hello"}],
             turn_count=1,
             last_output="world",
+            status=STATUS_AWAITING_USER,
+            pending_question="Which style?",
+            pending_fields=["style"],
+            pending_question_id="abc123",
         )
 
         restored = normalize_session(session.to_dict())
@@ -558,6 +688,10 @@ battle animation
         self.assertTrue(restored.compatible(signature))
         self.assertEqual(restored.messages[0]["content"], "hello")
         self.assertEqual(restored.turn_count, 1)
+        self.assertEqual(restored.status, STATUS_AWAITING_USER)
+        self.assertEqual(restored.pending_question, "Which style?")
+        self.assertEqual(restored.pending_fields, ["style"])
+        self.assertEqual(restored.pending_question_id, "abc123")
         self.assertFalse(restored.compatible(build_session_signature({"model": "b.gguf"})))
 
 

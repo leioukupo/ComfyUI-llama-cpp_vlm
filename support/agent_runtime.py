@@ -15,10 +15,16 @@ from .skill_runtime import SkillLibrary, skill_tool_specs
 AGENT_SYSTEM_PROMPT = """You are running inside ComfyUI with optional local skills and MCP tools.
 Local skills are private workflow instructions. Never recommend them, summarize them, or list them to the user unless the user explicitly asks for a skill catalog.
 Use tools only when they materially help with the user's request. If a local skill is relevant, call skill_list first, then skill_read before following detailed skill instructions.
+If you cannot produce the requested final result without the user's choice or missing information, call ask_user with one concise question and stop.
 Tool calls are executed automatically by the workflow. Do not claim that a tool was used unless the tool result is present in the conversation.
 If native tool calling is unavailable, request tools by replying with only this JSON shape:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
 After tool results are returned, continue normally and provide the final answer only."""
+
+STATUS_COMPLETE = "complete"
+STATUS_AWAITING_USER = "awaiting_user"
+STATUS_ERROR = "error"
+ASK_USER_TOOL_NAME = "ask_user"
 
 
 def strip_thinking(text: str) -> str:
@@ -115,6 +121,10 @@ class AgentRunResult:
     trace: List[Dict[str, Any]]
     selected_skills: List[str]
     transcript: List[Dict[str, Any]] = field(default_factory=list)
+    status: str = STATUS_COMPLETE
+    pending_question: str = ""
+    pending_fields: List[str] = field(default_factory=list)
+    pending_question_id: str = ""
 
     def trace_json(self) -> str:
         return json.dumps(self.trace, ensure_ascii=False, indent=2)
@@ -133,6 +143,10 @@ class ConversationSession:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     turn_count: int = 0
     last_output: str = ""
+    status: str = STATUS_COMPLETE
+    pending_question: str = ""
+    pending_fields: List[str] = field(default_factory=list)
+    pending_question_id: str = ""
 
     def compatible(self, signature: str) -> bool:
         return bool(self.signature) and self.signature == signature
@@ -147,6 +161,10 @@ class ConversationSession:
             "messages": _clone_messages(self.messages),
             "turn_count": self.turn_count,
             "last_output": self.last_output,
+            "status": self.status,
+            "pending_question": self.pending_question,
+            "pending_fields": list(self.pending_fields),
+            "pending_question_id": self.pending_question_id,
         }
 
     @classmethod
@@ -161,6 +179,10 @@ class ConversationSession:
             messages=_clone_messages(data.get("messages") or []),
             turn_count=int(data.get("turn_count") or 0),
             last_output=str(data.get("last_output") or ""),
+            status=str(data.get("status") or STATUS_COMPLETE),
+            pending_question=str(data.get("pending_question") or ""),
+            pending_fields=[str(item) for item in (data.get("pending_fields") or [])],
+            pending_question_id=str(data.get("pending_question_id") or ""),
         )
 
 
@@ -199,6 +221,66 @@ def _stable_json_dumps(value: Any) -> str:
 def build_session_signature(payload: Dict[str, Any]) -> str:
     blob = _stable_json_dumps(payload)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def ask_user_tool_spec() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": ASK_USER_TOOL_NAME,
+            "description": "Ask the workflow user one concise clarification question, then pause this agent run until the user answers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The exact question to show to the user.",
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional short field names that the answer should cover.",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    }
+
+
+def looks_like_user_question(text: str) -> bool:
+    value = strip_thinking(text)
+    if not value or len(value) > 2400:
+        return False
+
+    has_question_mark = "?" in value or "？" in value
+    patterns = [
+        r"你希望",
+        r"您希望",
+        r"你想",
+        r"您想",
+        r"请选择",
+        r"请告诉我",
+        r"告诉我.*偏好",
+        r"更倾向",
+        r"哪种",
+        r"哪个",
+        r"是否",
+        r"需要.*吗",
+        r"would you like",
+        r"do you want",
+        r"which .* would",
+        r"please choose",
+        r"could you provide",
+    ]
+    if has_question_mark and any(re.search(pattern, value, flags=re.IGNORECASE | re.DOTALL) for pattern in patterns):
+        return True
+    return bool(re.search(r"(你|您).*(希望|想|选择|提供|补充).*[？?]", value, flags=re.DOTALL))
+
+
+def _pending_question_id(question: str, fields: List[str]) -> str:
+    payload = _stable_json_dumps({"question": question, "fields": fields})
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _parse_arguments(arguments: Any) -> Dict[str, Any]:
@@ -487,6 +569,11 @@ class AgentRunner:
         tools: List[Dict[str, Any]] = []
         selected_skills: List[str] = []
 
+        ask_user_spec = ask_user_tool_spec()
+        tools.append(ask_user_spec)
+        tool_callbacks[ASK_USER_TOOL_NAME] = self._call_ask_user_tool
+        tool_metadata[ASK_USER_TOOL_NAME] = {"kind": "clarification", "provider": "agent"}
+
         if self.skill_library is not None:
             skill_language = self.skill_library.effective_language(_messages_text(messages))
             for spec in skill_tool_specs():
@@ -517,7 +604,13 @@ class AgentRunner:
                         raise
                     message = _context_overflow_message(_llm_context_size(self.llm))
                     trace.append({"step": step, "error": message, "exception": str(exc)[:4000], "branch": "error"})
-                    return AgentRunResult(output=message, trace=trace, selected_skills=selected_skills, transcript=transcript)
+                    return AgentRunResult(
+                        output=message,
+                        trace=trace,
+                        selected_skills=selected_skills,
+                        transcript=transcript,
+                        status=STATUS_ERROR,
+                    )
                 assistant_message = _message_from_completion(completion)
                 content = str(assistant_message.get("content") or "")
                 calls = extract_tool_calls(assistant_message, tool_names)
@@ -535,6 +628,26 @@ class AgentRunner:
                     }
                 )
 
+                ask_user_call = next((call for call in calls if call.name == ASK_USER_TOOL_NAME), None)
+                if ask_user_call is not None:
+                    result = self._execute_tool(ask_user_call, tool_callbacks, selected_skills)
+                    trace.append(self._trace_tool_result(step, ask_user_call, result, tool_metadata.get(ask_user_call.name, {})))
+                    pending = result.structured_content if isinstance(result.structured_content, dict) else {}
+                    question = strip_thinking(str(pending.get("question") or result.content or content))
+                    fields = [str(item) for item in (pending.get("fields") or [])]
+                    question_id = str(pending.get("question_id") or _pending_question_id(question, fields))
+                    transcript.append({"role": "assistant", "content": question})
+                    return AgentRunResult(
+                        output=question,
+                        trace=trace,
+                        selected_skills=selected_skills,
+                        transcript=transcript,
+                        status=STATUS_AWAITING_USER,
+                        pending_question=question,
+                        pending_fields=fields,
+                        pending_question_id=question_id,
+                    )
+
                 if not calls:
                     sanitized_assistant = _sanitize_message_for_transcript(assistant_message)
                     if not sanitized_assistant.get("content") and strip_thinking(content):
@@ -545,6 +658,7 @@ class AgentRunner:
                         trace=trace,
                         selected_skills=selected_skills,
                         transcript=transcript,
+                        status=STATUS_COMPLETE,
                     )
 
                 if calls[0].source == "native":
@@ -599,6 +713,7 @@ class AgentRunner:
                 trace=trace,
                 selected_skills=selected_skills,
                 transcript=transcript,
+                status=STATUS_ERROR,
             )
 
     def _prepare_messages(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -671,6 +786,28 @@ class AgentRunner:
 
         if canonical_name and canonical_name not in selected_skills:
             selected_skills.append(canonical_name)
+
+    def _call_ask_user_tool(self, arguments: Dict[str, Any]) -> MCPCallResult:
+        args = (arguments or {}).copy()
+        question = strip_thinking(str(args.get("question") or args.get("prompt") or args.get("message") or "")).strip()
+        if not question:
+            question = "Please provide the missing information needed to continue."
+
+        raw_fields = args.get("fields") or []
+        if isinstance(raw_fields, str):
+            fields = [part.strip() for part in re.split(r"[\n,;，；、]+", raw_fields) if part.strip()]
+        elif isinstance(raw_fields, list):
+            fields = [str(item).strip() for item in raw_fields if str(item).strip()]
+        else:
+            fields = []
+
+        question_id = _pending_question_id(question, fields)
+        payload = {
+            "question": question,
+            "fields": fields,
+            "question_id": question_id,
+        }
+        return MCPCallResult(content=question, is_error=False, structured_content=payload)
 
     def _call_skill_tool(self, tool_name: str, arguments: Dict[str, Any], language: str) -> str:
         args = (arguments or {}).copy()
