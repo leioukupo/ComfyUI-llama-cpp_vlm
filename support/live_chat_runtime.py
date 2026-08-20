@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from .agent_runtime import (
+    AgentRunner,
+    STATUS_ERROR as AGENT_STATUS_ERROR,
     _context_overflow_message,
     _is_context_overflow_error,
     _llm_context_size,
@@ -51,27 +53,36 @@ def render_transcript(messages: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for message in messages:
         role = str(message.get("role") or "").strip().lower()
-        if role == "system":
+        if role in {"system", "tool"}:
             continue
         text = _message_text(message)
         if not text:
             continue
+        if text.startswith("Requested tool calls:") or text.startswith("Tool results:"):
+            continue
         label = {
             "user": "User",
             "assistant": "Assistant",
-            "tool": "Tool",
         }.get(role, role.title() or "Message")
         lines.append(f"{label}: {text}")
     return "\n\n".join(lines).strip()
 
 
-def build_live_session_signature(llama_model: Any, system_prompt: str, parameters: Optional[Dict[str, Any]] = None) -> str:
+def build_live_session_signature(
+    llama_model: Any,
+    system_prompt: str,
+    parameters: Optional[Dict[str, Any]] = None,
+    skills: Any = None,
+    mcp_config: Any = None,
+) -> str:
     return build_session_signature(
         {
             "mode": "live_chat",
             "llama_model": llama_model,
             "system_prompt": system_prompt or "",
             "parameters": parameters or {},
+            "skills": skills,
+            "mcp_config": mcp_config,
         }
     )
 
@@ -98,6 +109,8 @@ class LiveChatSession:
     status: str = STATUS_IDLE
     stop_requested: bool = False
     error: str = ""
+    tool_trace: List[Dict[str, Any]] = field(default_factory=list)
+    selected_skills: List[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     condition: threading.Condition = field(default_factory=threading.Condition, repr=False, compare=False)
@@ -138,6 +151,10 @@ class LiveChatSession:
             self.condition.notify_all()
 
     def snapshot(self) -> Dict[str, Any]:
+        conversation = render_transcript(self.messages)
+        if self.error:
+            error_line = f"Error: {self.error}"
+            conversation = f"{conversation}\n\n{error_line}".strip() if conversation else error_line
         return {
             "state_uid": self.state_uid,
             "node_id": self.node_id,
@@ -146,11 +163,13 @@ class LiveChatSession:
             "status": self.status,
             "turn_count": self.turn_count,
             "last_output": self.last_output,
-            "conversation": render_transcript(self.messages),
+            "conversation": conversation,
             "messages": _clone_messages(self.messages),
             "pending_count": len(self.pending_user_messages),
             "stop_requested": self.stop_requested,
             "error": self.error,
+            "tool_trace": _clone_messages(self.tool_trace),
+            "selected_skills": list(self.selected_skills),
             "started_at": self.started_at,
             "updated_at": self.updated_at,
         }
@@ -267,12 +286,15 @@ def run_live_chat(
     should_stop: Callable[[], bool],
     emit_state: Callable[[LiveChatSession, str], None],
     initial_user_message: str = "",
+    skill_library: Any = None,
+    mcp_config: Any = None,
 ) -> LiveChatSession:
     full_messages = []
     if session.system_prompt.strip():
         full_messages.append({"role": "system", "content": session.system_prompt})
     if session.messages:
         full_messages.extend(_clone_messages(session.messages))
+    use_agent = skill_library is not None or bool(getattr(mcp_config, "enabled", False))
 
     next_user_message = strip_thinking(str(initial_user_message or "")).strip()
     if initial_user_message.strip():
@@ -306,6 +328,35 @@ def run_live_chat(
         emit_state(session, "user")
 
         try:
+            if use_agent:
+                runner = AgentRunner(
+                    llm,
+                    seed=seed,
+                    parameters=parameters,
+                    skill_library=skill_library,
+                    mcp_config=mcp_config,
+                )
+                result = runner.run(full_messages)
+                session.tool_trace.extend(result.trace)
+                for name in result.selected_skills:
+                    if name not in session.selected_skills:
+                        session.selected_skills.append(name)
+                if result.status == AGENT_STATUS_ERROR:
+                    session.status = STATUS_ERROR
+                    session.error = result.output or "Live chat agent failed."
+                    emit_state(session, "error")
+                    break
+
+                session.messages = _clone_messages(result.transcript)
+                session.last_output = strip_thinking(result.output)
+                session.turn_count += 1
+                full_messages = []
+                if session.system_prompt.strip():
+                    full_messages.append({"role": "system", "content": session.system_prompt})
+                full_messages.extend(_clone_messages(session.messages))
+                emit_state(session, "assistant")
+                continue
+
             reply = generate_chat_reply(llm, seed, full_messages, parameters)
         except Exception as exc:
             if isinstance(exc, RuntimeError) and _is_context_overflow_error(exc):

@@ -1670,16 +1670,18 @@ class llama_cpp_live_chat:
             },
             "optional": {
                 "parameters": ("LLAMACPPARAMS",),
+                "skills": ("LLAMACPPSKILLS",),
+                "mcp_config": ("LLAMACPPMCP",),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "LLAMACPPSESSION", "STRING")
-    RETURN_NAMES = ("output", "conversation_log", "state_uid", "session", "status")
-    OUTPUT_IS_LIST = (False, False, False, False, False)
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "LLAMACPPSESSION", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("output", "conversation_log", "state_uid", "session", "status", "tool_trace", "selected_skills")
+    OUTPUT_IS_LIST = (False, False, False, False, False, False, False)
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm/agent"
 
-    def process(self, llama_model, user_message, conversation_log, live_status, system_prompt, seed, force_offload, unique_id, parameters=None):
+    def process(self, llama_model, user_message, conversation_log, live_status, system_prompt, seed, force_offload, unique_id, parameters=None, skills=None, mcp_config=None):
         llama_model = _unwrap_list_value(llama_model)
         user_message = str(_unwrap_list_value(user_message) or "")
         conversation_log = str(_unwrap_list_value(conversation_log) or "")
@@ -1689,6 +1691,8 @@ class llama_cpp_live_chat:
         force_offload = _unwrap_list_value(force_offload)
         unique_id = _unwrap_list_value(unique_id)
         parameters = _unwrap_list_value(parameters)
+        skills = _unwrap_list_value(skills)
+        mcp_config = _unwrap_list_value(mcp_config)
 
         if parameters is None:
             parameters = {}
@@ -1697,8 +1701,16 @@ class llama_cpp_live_chat:
         if _MTMD:
             _parameters.pop("present_penalty", None)
 
-        uid = str(unique_id).rpartition(".")[-1]
-        signature = build_live_session_signature(llama_model, system_prompt, {"seed": seed, **_parameters})
+        node_id = str(unique_id).rpartition(".")[-1]
+        uid = _resolve_state_uid(unique_id, _parameters)
+        _parameters.pop("state_uid", None)
+        signature = build_live_session_signature(
+            llama_model,
+            system_prompt,
+            {"seed": seed, **_parameters},
+            skills=skills,
+            mcp_config=mcp_config,
+        )
 
         if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != llama_model:
             print("[llama-cpp_vlm] Loading model...")
@@ -1706,7 +1718,7 @@ class llama_cpp_live_chat:
 
         LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
 
-        session = LIVE_CHAT_MANAGER.open_session(uid, uid, signature, system_prompt)
+        session = LIVE_CHAT_MANAGER.open_session(uid, node_id, signature, system_prompt)
         session.status = LIVE_STATUS_RUNNING if user_message.strip() else LIVE_STATUS_WAITING
         _emit_live_chat_state(session, "opened")
 
@@ -1720,6 +1732,8 @@ class llama_cpp_live_chat:
                 mm.processing_interrupted,
                 _emit_live_chat_state,
                 user_message,
+                skill_library=skills,
+                mcp_config=mcp_config,
             )
         except Exception as exc:
             session.status = LIVE_STATUS_ERROR
@@ -1729,6 +1743,8 @@ class llama_cpp_live_chat:
 
         output = live_session.error if live_session.status == LIVE_STATUS_ERROR and live_session.error else live_session.last_output
         transcript = render_live_transcript(live_session.messages)
+        if live_session.status == LIVE_STATUS_ERROR and live_session.error:
+            transcript = f"{transcript}\n\nError: {live_session.error}".strip() if transcript else f"Error: {live_session.error}"
         final_status = STATUS_ERROR if live_session.status == LIVE_STATUS_ERROR else STATUS_COMPLETE
 
         final_session = ConversationSession(
@@ -1754,7 +1770,15 @@ class llama_cpp_live_chat:
                     pass
 
         gc.collect()
-        return (output, transcript, uid, final_session, live_session.status)
+        return (
+            output,
+            transcript,
+            uid,
+            final_session,
+            live_session.status,
+            json.dumps(live_session.tool_trace, ensure_ascii=False, indent=2),
+            json.dumps(live_session.selected_skills, ensure_ascii=False),
+        )
 
 class llama_cpp_clean_states:
     @classmethod

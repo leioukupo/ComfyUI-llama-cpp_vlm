@@ -1,6 +1,8 @@
 import threading
 import time
+import tempfile
 import unittest
+from pathlib import Path
 
 from support.live_chat_runtime import (
     LiveChatManager,
@@ -9,6 +11,7 @@ from support.live_chat_runtime import (
     render_transcript,
     run_live_chat,
 )
+from support.skill_runtime import scan_skill_directory
 
 
 class FakeLLM:
@@ -111,6 +114,50 @@ class TestLiveChatRuntime(unittest.TestCase):
         self.assertEqual(session_b.signature, sig_b)
         self.assertEqual(session_b.messages, [])
         self.assertIsNot(session_a, session_b)
+
+    def test_live_run_can_use_skill_tools_without_polluting_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "video-prompt"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: video-prompt\ndescription: Write video prompts.\n---\n# Video Prompt\nUse cinematic beats.",
+                encoding="utf-8",
+            )
+            library = scan_skill_directory(str(root), selected_skills="video-prompt", language="en")
+
+            manager = LiveChatManager()
+            signature = build_live_session_signature("demo.gguf", "hello", {"temperature": 0.7}, skills=library)
+            session = manager.open_session("node-1", "node-1", signature, "hello")
+
+            def emit_state(current_session, event):
+                if event == "assistant":
+                    manager.end_session(node_id="node-1")
+
+            result = run_live_chat(
+                manager,
+                FakeLLM(
+                    [
+                        '{"tool_calls":[{"name":"skill_read","arguments":{"skill_name":"video-prompt"}}]}',
+                        "最终提示词：小男孩与怪兽在雨夜街巷中对峙。",
+                    ]
+                ),
+                seed=0,
+                parameters={},
+                session=session,
+                should_stop=lambda: False,
+                emit_state=emit_state,
+                initial_user_message="生成视频提示词",
+                skill_library=library,
+            )
+
+            transcript = render_transcript(result.messages)
+
+            self.assertEqual(result.status, STATUS_ENDED)
+            self.assertEqual(result.selected_skills, ["video-prompt"])
+            self.assertIn("最终提示词", result.last_output)
+            self.assertIn("最终提示词", transcript)
+            self.assertNotIn("Tool results:", transcript)
 
 
 if __name__ == "__main__":
