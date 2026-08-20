@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from support.agent_runtime import AgentRunner, extract_tool_calls, strip_thinking
+from support.agent_runtime import AgentRunner, ConversationSession, build_session_signature, extract_tool_calls, normalize_session, strip_thinking
 from support.auto_budget import normalize_n_ctx_for_chat_handler, resolve_auto_budget
 from support.mcp_runtime import MCPRuntimeConfig, MCPServerConfig, MCPToolbox, format_mcp_result, parse_mcp_config
 from support.skill_runtime import scan_skill_directory
@@ -347,7 +347,7 @@ zh
             )
 
             self.assertEqual(result.output, "Final answer")
-            self.assertEqual(result.selected_skills, ["demo"])
+            self.assertEqual(result.selected_skills, [])
             self.assertTrue(any(event.get("tool") == "skill_list" for event in result.trace))
 
     def test_agent_fallback_loop_executes_xml_skill_tool(self):
@@ -392,6 +392,54 @@ battle animation
 
             self.assertEqual(result.output, "Final video prompt")
             self.assertTrue(any(event.get("tool") == "skill_list" for event in result.trace))
+
+    def test_agent_native_tool_calls_execute_and_update_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = Path(tmp) / "demo"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: demo\ndescription: Demo skill.\n---\n# Demo\nUse the demo skill.",
+                encoding="utf-8",
+            )
+            library = scan_skill_directory(tmp)
+
+            class FakeLLM:
+                def __init__(self):
+                    self.calls = 0
+
+                def create_chat_completion(self, **kwargs):
+                    self.calls += 1
+                    if self.calls == 1:
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_1",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "skill_read",
+                                                    "arguments": '{"skill_name":"demo"}',
+                                                },
+                                            }
+                                        ],
+                                    }
+                                }
+                            ]
+                        }
+                    return {"choices": [{"message": {"role": "assistant", "content": "Final answer"}}]}
+
+            result = AgentRunner(FakeLLM(), seed=0, skill_library=library).run(
+                [{"role": "user", "content": "Use a skill."}]
+            )
+
+            self.assertEqual(result.output, "Final answer")
+            self.assertEqual(result.selected_skills, ["demo"])
+            self.assertEqual(result.trace[0]["branch"], "native")
+            self.assertTrue(any(message.get("role") == "tool" for message in result.transcript))
 
     def test_agent_context_overflow_returns_actionable_message(self):
         class FakeLLM:
@@ -448,9 +496,69 @@ battle animation
             )
 
             self.assertEqual(result.output, "完成")
+            self.assertEqual(result.selected_skills, ["demo"])
             skill_read_events = [event for event in result.trace if event.get("tool") == "skill_read"]
             self.assertEqual(len(skill_read_events), 1)
             self.assertIn("SKILL.cn.md", skill_read_events[0]["content"])
+
+    def test_agent_transcript_preserves_tool_loop_without_system_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_dir = Path(tmp) / "demo"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: demo\ndescription: Demo skill.\n---\n# Demo\nUse the demo skill.",
+                encoding="utf-8",
+            )
+            library = scan_skill_directory(tmp)
+
+            class FakeLLM:
+                def __init__(self):
+                    self.calls = 0
+
+                def create_chat_completion(self, **kwargs):
+                    self.calls += 1
+                    if "tools" in kwargs:
+                        raise TypeError("tools are not supported")
+                    if self.calls == 2:
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": '{"tool_calls":[{"name":"skill_read","arguments":{"skill_name":"demo"}}]}'
+                                    }
+                                }
+                            ]
+                        }
+                    return {"choices": [{"message": {"content": "Final answer"}}]}
+
+            result = AgentRunner(FakeLLM(), seed=0, skill_library=library).run(
+                [
+                    {"role": "system", "content": "System prompt"},
+                    {"role": "user", "content": "Use a skill."},
+                ]
+            )
+
+            self.assertEqual(result.selected_skills, ["demo"])
+            self.assertEqual(result.transcript[0]["role"], "user")
+            self.assertFalse(any(message.get("role") == "system" for message in result.transcript))
+            self.assertTrue(any("Tool results" in str(message.get("content")) for message in result.transcript))
+
+    def test_conversation_session_roundtrip_and_signature(self):
+        signature = build_session_signature({"model": "a.gguf", "system_prompt": "hi"})
+        session = ConversationSession(
+            state_uid="42",
+            signature=signature,
+            messages=[{"role": "user", "content": "hello"}],
+            turn_count=1,
+            last_output="world",
+        )
+
+        restored = normalize_session(session.to_dict())
+
+        self.assertTrue(restored.compatible(signature))
+        self.assertEqual(restored.messages[0]["content"], "hello")
+        self.assertEqual(restored.turn_count, 1)
+        self.assertFalse(restored.compatible(build_session_signature({"model": "b.gguf"})))
 
 
 if __name__ == "__main__":

@@ -23,7 +23,10 @@ python -m pip install -r ComfyUI-llama-cpp/requirements.txt
 
 ## Agent, Skills, and MCP
 
-Use `Llama-cpp Agent Instruct` when you want the local llama.cpp model to read local skills or call MCP tools. Connect:
+Use the Agent nodes when you want the local llama.cpp model to read local skills or call MCP tools:
+
+- `Llama-cpp Agent Instruct` keeps the existing one-by-one / images / video batch workflow for one workflow run.
+- `Llama-cpp Agent Chat` is for real multi-turn chat. Feed its `session` output back into the next run's `session` input, or keep the same `state_uid`, to continue across ComfyUI runs.
 
 - `Llama-cpp Skill Library` for local `SKILL.md` folders. By default it scans this custom node's `skills/` directory.
 - `Llama-cpp MCP Config` for MCP servers. It accepts `mcpServers` / `servers` JSON with stdio or Streamable HTTP entries.
@@ -46,7 +49,7 @@ Example MCP config:
 }
 ```
 
-Tool calls are automatically executed by default. Use the MCP Config node's step, timeout, and result-size limits to keep runs bounded.
+Tool calls are automatically executed by default. Use the MCP Config node's step, timeout, and result-size limits to keep runs bounded. `selected_skills` only contains skills actually read in the current run, and `tool_trace` records skill/MCP activity.
 
 ## Credits  
 - [llama-cpp-python](https://github.com/JamePeng/llama-cpp-python) @JamePeng  

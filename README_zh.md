@@ -23,7 +23,10 @@ python -m pip install -r ComfyUI-llama-cpp/requirements.txt
 
 ## Agent、Skills 与 MCP
 
-需要让本地 llama.cpp 模型读取 skill 或调用 MCP 工具时，请使用 `Llama-cpp Agent Instruct`。可连接：
+需要让本地 llama.cpp 模型读取 skill 或调用 MCP 工具时，请使用新的 Agent 节点：
+
+- `Llama-cpp Agent Instruct`：保留原有 one-by-one / images / video 批处理习惯，适合一次 workflow 内完成图像、视频或文本任务。
+- `Llama-cpp Agent Chat`：用于真正多轮对话。把上一轮输出的 `session` 接回下一轮的 `session` 输入，或保持同一个 `state_uid`，即可跨多次 ComfyUI 运行续聊。
 
 - `Llama-cpp Skill Library`：读取本地 `SKILL.md` 目录，默认扫描本插件目录下的 `skills/`。
 - `Llama-cpp MCP Config`：配置 MCP server，支持 `mcpServers` / `servers` JSON，包含 stdio 与 Streamable HTTP。
@@ -46,7 +49,7 @@ MCP 配置示例：
 }
 ```
 
-工具调用默认自动执行；可在 MCP Config 节点中设置最大 agent 步数、工具超时和工具结果长度上限。
+工具调用默认自动执行；可在 MCP Config 节点中设置最大 agent 步数、工具超时和工具结果长度上限。`selected_skills` 只会返回本轮真正读取过的 skill，`tool_trace` 会记录 skill/MCP 调用过程。
 
 ## 致谢
 - [llama-cpp-python](https://github.com/JamePeng/llama-cpp-python) @JamePeng  

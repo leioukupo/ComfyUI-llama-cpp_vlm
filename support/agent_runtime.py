@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import json
 import re
@@ -113,12 +114,68 @@ class AgentRunResult:
     output: str
     trace: List[Dict[str, Any]]
     selected_skills: List[str]
+    transcript: List[Dict[str, Any]] = field(default_factory=list)
 
     def trace_json(self) -> str:
         return json.dumps(self.trace, ensure_ascii=False, indent=2)
 
     def selected_skills_json(self) -> str:
         return json.dumps(self.selected_skills, ensure_ascii=False)
+
+    def transcript_json(self) -> str:
+        return json.dumps(self.transcript, ensure_ascii=False, indent=2)
+
+
+@dataclass
+class ConversationSession:
+    state_uid: str
+    signature: str
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    turn_count: int = 0
+    last_output: str = ""
+
+    def compatible(self, signature: str) -> bool:
+        return bool(self.signature) and self.signature == signature
+
+    def clone(self) -> "ConversationSession":
+        return ConversationSession.from_dict(self.to_dict())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "state_uid": self.state_uid,
+            "signature": self.signature,
+            "messages": _clone_messages(self.messages),
+            "turn_count": self.turn_count,
+            "last_output": self.last_output,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ConversationSession":
+        if isinstance(data, ConversationSession):
+            return data.clone()
+        if not isinstance(data, dict):
+            raise TypeError("ConversationSession data must be a dict or ConversationSession.")
+        return cls(
+            state_uid=str(data.get("state_uid") or ""),
+            signature=str(data.get("signature") or ""),
+            messages=_clone_messages(data.get("messages") or []),
+            turn_count=int(data.get("turn_count") or 0),
+            last_output=str(data.get("last_output") or ""),
+        )
+
+
+def normalize_session(session: Any) -> Optional[ConversationSession]:
+    if session in (None, ""):
+        return None
+    if isinstance(session, ConversationSession):
+        return session.clone()
+    if isinstance(session, dict):
+        return ConversationSession.from_dict(session)
+    if hasattr(session, "to_dict"):
+        return ConversationSession.from_dict(session.to_dict())
+    if hasattr(session, "__dict__"):
+        return ConversationSession.from_dict(session.__dict__)
+    return None
 
 
 def _json_default(value: Any) -> Any:
@@ -133,6 +190,15 @@ def _json_default(value: Any) -> Any:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=_json_default)
+
+
+def _stable_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default, sort_keys=True, separators=(",", ":"))
+
+
+def build_session_signature(payload: Dict[str, Any]) -> str:
+    blob = _stable_json_dumps(payload)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def _parse_arguments(arguments: Any) -> Dict[str, Any]:
@@ -373,6 +439,25 @@ def _context_overflow_message(n_ctx: int) -> str:
     )
 
 
+def _sanitize_message_for_transcript(message: Dict[str, Any]) -> Dict[str, Any]:
+    cloned = json.loads(json.dumps(message))
+    content = cloned.get("content")
+    if isinstance(content, str):
+        cloned["content"] = strip_thinking(content)
+    elif isinstance(content, list):
+        sanitized_content = []
+        for item in content:
+            if isinstance(item, dict):
+                cloned_item = json.loads(json.dumps(item))
+                if cloned_item.get("type") == "text":
+                    cloned_item["text"] = strip_thinking(str(cloned_item.get("text") or ""))
+                sanitized_content.append(cloned_item)
+            else:
+                sanitized_content.append(item)
+        cloned["content"] = sanitized_content
+    return cloned
+
+
 class AgentRunner:
     def __init__(
         self,
@@ -398,17 +483,18 @@ class AgentRunner:
     def _run_sync(self, messages: List[Dict[str, Any]]) -> AgentRunResult:
         trace: List[Dict[str, Any]] = []
         tool_callbacks: Dict[str, Callable[[Dict[str, Any]], Any]] = {}
+        tool_metadata: Dict[str, Dict[str, str]] = {}
         tools: List[Dict[str, Any]] = []
         selected_skills: List[str] = []
 
         if self.skill_library is not None:
             skill_language = self.skill_library.effective_language(_messages_text(messages))
-            selected_skills = self.skill_library.available_names()
             for spec in skill_tool_specs():
                 name = _tool_name(spec)
                 if name:
                     tools.append(spec)
                     tool_callbacks[name] = lambda args, tool_name=name, lang=skill_language: self._call_skill_tool(tool_name, args, lang)
+                    tool_metadata[name] = {"kind": "skill", "provider": "local"}
 
         with SyncMCPToolbox(self.mcp_config) as mcp_tools:
             for spec in mcp_tools.openai_tools():
@@ -416,8 +502,10 @@ class AgentRunner:
                 if name:
                     tools.append(spec)
                     tool_callbacks[name] = lambda args, tool_name=name: mcp_tools.call_tool(tool_name, args)
+                    tool_metadata[name] = {"kind": "mcp", "provider": name.split("__", 1)[0]}
 
             working_messages = self._prepare_messages(messages, tools)
+            transcript = [message for message in _clone_messages(messages) if message.get("role") != "system"]
             tool_names = [_tool_name(tool) for tool in tools]
             max_steps = max(1, self.mcp_config.max_agent_steps)
 
@@ -428,16 +516,18 @@ class AgentRunner:
                     if not _is_context_overflow_error(exc):
                         raise
                     message = _context_overflow_message(_llm_context_size(self.llm))
-                    trace.append({"step": step, "error": message, "exception": str(exc)[:4000]})
-                    return AgentRunResult(output=message, trace=trace, selected_skills=selected_skills)
+                    trace.append({"step": step, "error": message, "exception": str(exc)[:4000], "branch": "error"})
+                    return AgentRunResult(output=message, trace=trace, selected_skills=selected_skills, transcript=transcript)
                 assistant_message = _message_from_completion(completion)
                 content = str(assistant_message.get("content") or "")
                 calls = extract_tool_calls(assistant_message, tool_names)
+                branch = "native" if calls and calls[0].source == "native" else "fallback" if calls else "final"
 
                 trace.append(
                     {
                         "step": step,
                         "assistant": strip_thinking(content)[:4000],
+                        "branch": branch,
                         "tool_calls": [
                             {"name": call.name, "arguments": call.arguments, "source": call.source}
                             for call in calls
@@ -446,32 +536,46 @@ class AgentRunner:
                 )
 
                 if not calls:
-                    return AgentRunResult(output=strip_thinking(content), trace=trace, selected_skills=selected_skills)
+                    sanitized_assistant = _sanitize_message_for_transcript(assistant_message)
+                    if not sanitized_assistant.get("content") and strip_thinking(content):
+                        sanitized_assistant["content"] = strip_thinking(content)
+                    transcript.append(sanitized_assistant)
+                    return AgentRunResult(
+                        output=strip_thinking(content),
+                        trace=trace,
+                        selected_skills=selected_skills,
+                        transcript=transcript,
+                    )
 
                 if calls[0].source == "native":
-                    working_messages.append(assistant_message)
+                    sanitized_assistant = _sanitize_message_for_transcript(assistant_message)
+                    working_messages.append(sanitized_assistant)
+                    transcript.append(sanitized_assistant)
                     for call in calls:
-                        result = self._execute_tool(call, tool_callbacks)
-                        working_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call.call_id,
-                                "name": call.name,
-                                "content": result.content,
-                            }
-                        )
-                        trace.append(self._trace_tool_result(step, call, result))
+                        result = self._execute_tool(call, tool_callbacks, selected_skills)
+                        tool_message = {
+                            "role": "tool",
+                            "tool_call_id": call.call_id,
+                            "name": call.name,
+                            "content": result.content,
+                        }
+                        working_messages.append(tool_message)
+                        transcript.append(tool_message)
+                        trace.append(self._trace_tool_result(step, call, result, tool_metadata.get(call.name, {})))
                 else:
                     fallback_call_summaries = [
                         {"name": call.name, "arguments": call.arguments}
                         for call in calls
                     ]
-                    working_messages.append(
-                        {"role": "assistant", "content": "Requested tool calls:\n" + _json_dumps(fallback_call_summaries)}
-                    )
+                    synthetic_assistant = {
+                        "role": "assistant",
+                        "content": "Requested tool calls:\n" + _json_dumps(fallback_call_summaries),
+                    }
+                    working_messages.append(synthetic_assistant)
+                    transcript.append(synthetic_assistant)
                     fallback_results = []
                     for call in calls:
-                        result = self._execute_tool(call, tool_callbacks)
+                        result = self._execute_tool(call, tool_callbacks, selected_skills)
                         fallback_results.append(
                             {
                                 "name": call.name,
@@ -480,20 +584,21 @@ class AgentRunner:
                                 "content": result.content,
                             }
                         )
-                        trace.append(self._trace_tool_result(step, call, result))
-                    working_messages.append(
-                        {
-                            "role": "user",
-                            "content": "Tool results:\n"
-                            + _json_dumps(fallback_results)
-                            + "\nUse these results to continue or provide the final answer.",
-                        }
-                    )
+                        trace.append(self._trace_tool_result(step, call, result, tool_metadata.get(call.name, {})))
+                    tool_result_message = {
+                        "role": "user",
+                        "content": "Tool results:\n"
+                        + _json_dumps(fallback_results)
+                        + "\nUse these results to continue or provide the final answer.",
+                    }
+                    working_messages.append(tool_result_message)
+                    transcript.append(tool_result_message)
 
             return AgentRunResult(
-                output=strip_thinking(content) or "Agent stopped because max_agent_steps was reached.",
+                output="Agent stopped because max_agent_steps was reached.",
                 trace=trace,
                 selected_skills=selected_skills,
+                transcript=transcript,
             )
 
     def _prepare_messages(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -528,6 +633,7 @@ class AgentRunner:
         self,
         call: AgentToolCall,
         callbacks: Dict[str, Callable[[Dict[str, Any]], Any]],
+        selected_skills: List[str],
     ) -> MCPCallResult:
         callback = callbacks.get(call.name)
         if callback is None:
@@ -538,14 +644,33 @@ class AgentRunner:
             if inspect.isawaitable(result):
                 result = run_coro_sync(result)
             if isinstance(result, MCPCallResult):
+                self._record_skill_use(call, result, selected_skills)
                 return result
             text = str(result)
             limit = self.mcp_config.max_tool_result_chars
             if len(text) > limit:
                 text = text[:limit].rstrip() + f"\n\n[truncated to {limit} characters]"
-            return MCPCallResult(content=text, is_error=False)
+            wrapped = MCPCallResult(content=text, is_error=False)
+            self._record_skill_use(call, wrapped, selected_skills)
+            return wrapped
         except Exception as exc:
             return MCPCallResult(content=f'Tool "{call.name}" failed: {exc}', is_error=True)
+
+    def _record_skill_use(self, call: AgentToolCall, result: MCPCallResult, selected_skills: List[str]) -> None:
+        if self.skill_library is None or call.name != "skill_read" or result.is_error:
+            return
+
+        skill_name = str(call.arguments.get("skill_name") or call.arguments.get("name") or "").strip()
+        if not skill_name:
+            return
+
+        try:
+            canonical_name = self.skill_library.canonical_name(skill_name)
+        except Exception:
+            canonical_name = skill_name
+
+        if canonical_name and canonical_name not in selected_skills:
+            selected_skills.append(canonical_name)
 
     def _call_skill_tool(self, tool_name: str, arguments: Dict[str, Any], language: str) -> str:
         args = (arguments or {}).copy()
@@ -559,10 +684,19 @@ class AgentRunner:
             )
         return self.skill_library.call_tool(tool_name, args)
 
-    def _trace_tool_result(self, step: int, call: AgentToolCall, result: MCPCallResult) -> Dict[str, Any]:
+    def _trace_tool_result(
+        self,
+        step: int,
+        call: AgentToolCall,
+        result: MCPCallResult,
+        metadata: Dict[str, str],
+    ) -> Dict[str, Any]:
         return {
             "step": step,
             "tool": call.name,
+            "tool_kind": metadata.get("kind", "unknown"),
+            "tool_provider": metadata.get("provider", ""),
+            "source": call.source,
             "arguments": call.arguments,
             "is_error": result.is_error,
             "content": result.content[:4000],

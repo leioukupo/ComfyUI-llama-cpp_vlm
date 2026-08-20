@@ -18,7 +18,7 @@ from .support.auto_budget import (
     resolve_auto_budget,
 )
 from .support.prompt_enhancer_preset import *
-from .support.agent_runtime import AgentRunner, strip_thinking
+from .support.agent_runtime import AgentRunner, ConversationSession, build_session_signature, normalize_session, strip_thinking
 from .support.mcp_runtime import parse_mcp_config
 from .support.skill_runtime import scan_skill_directory
 
@@ -175,6 +175,7 @@ class LLAMA_CPP_STORAGE:
     current_embedding_mode = False
     messages = {}
     sys_prompts = {}
+    sessions = {}
     
     @classmethod
     def ensure_embedding_mode(cls, enable_embeddings: bool):
@@ -225,9 +226,30 @@ class LLAMA_CPP_STORAGE:
         if id == -1:
             cls.messages.clear()
             cls.sys_prompts.clear()
+            cls.sessions.clear()
         else:
             cls.messages.pop(f"{id}", None)
             cls.sys_prompts.pop(f"{id}", None)
+            cls.sessions.pop(f"{id}", None)
+
+    @classmethod
+    def get_session(cls, uid):
+        session = cls.sessions.get(f"{uid}")
+        if session is None:
+            return None
+        try:
+            return session.clone()
+        except Exception:
+            return session
+
+    @classmethod
+    def set_session(cls, uid, session):
+        key = f"{uid}"
+        if session is None:
+            cls.sessions.pop(key, None)
+            return
+        normalized = normalize_session(session)
+        cls.sessions[key] = normalized if normalized is not None else session
         
     @classmethod
     def clean(cls, all=False):
@@ -571,6 +593,47 @@ def draw_bbox(image, json_data, mode):
         draw.rectangle([text_size[0], text_size[1]-2, text_size[2]+4, text_size[3]+2], fill=color)
         draw.text((x0+2, text_y), str(label), fill=(255,255,255))
     return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
+
+
+def _unwrap_list_value(value):
+    if isinstance(value, list) and value:
+        return value[0]
+    return value
+
+
+def _resolve_state_uid(unique_id, parameters=None, session=None):
+    if parameters is not None:
+        state_uid = parameters.get("state_uid", None)
+        if state_uid not in (None, "", -1):
+            return str(state_uid)
+
+    if session is not None:
+        session_uid = session.get("state_uid") if isinstance(session, dict) else getattr(session, "state_uid", None)
+        if session_uid not in (None, ""):
+            return str(session_uid)
+
+    return str(unique_id).rpartition(".")[-1]
+
+
+def _build_session_signature(llama_model, system_prompt, skills, mcp_config, mode="chat"):
+    return build_session_signature(
+        {
+            "mode": mode,
+            "llama_model": llama_model,
+            "system_prompt": system_prompt or "",
+            "skills": skills,
+            "mcp_config": mcp_config,
+        }
+    )
+
+
+def _coerce_session(session, uid, signature):
+    session = normalize_session(session)
+    if session is None or not session.compatible(signature):
+        return ConversationSession(state_uid=uid, signature=signature)
+    session.state_uid = uid
+    session.signature = signature
+    return session
 
 class llama_cpp_model_loader:
     @classmethod
@@ -1241,7 +1304,130 @@ class llama_cpp_agent_instruct(llama_cpp_instruct_adv):
             json.dumps(tool_trace, ensure_ascii=False, indent=2),
             json.dumps(selected_skill_names, ensure_ascii=False),
         )
-    
+
+
+class llama_cpp_agent_chat:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "llama_model": ("LLAMACPPMODEL",),
+                "user_prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Ask the model to continue the conversation."
+                }),
+                "system_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
+                "force_offload": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Unload the model after inference."
+                }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
+            "optional": {
+                "parameters": ("LLAMACPPARAMS",),
+                "session": ("LLAMACPPSESSION",),
+                "skills": ("LLAMACPPSKILLS",),
+                "mcp_config": ("LLAMACPPMCP",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING", "LLAMACPPSESSION")
+    RETURN_NAMES = ("output", "output_list", "state_uid", "tool_trace", "selected_skills", "session")
+    OUTPUT_IS_LIST = (False, True, False, False, False, False)
+    FUNCTION = "process"
+    CATEGORY = "llama-cpp-vlm/agent"
+
+    def process(self, llama_model, user_prompt, system_prompt, seed, force_offload, unique_id, parameters=None, session=None, skills=None, mcp_config=None):
+        llama_model = _unwrap_list_value(llama_model)
+        user_prompt = str(_unwrap_list_value(user_prompt) or "")
+        system_prompt = str(_unwrap_list_value(system_prompt) or "")
+        seed = _unwrap_list_value(seed)
+        force_offload = _unwrap_list_value(force_offload)
+        unique_id = _unwrap_list_value(unique_id)
+        parameters = _unwrap_list_value(parameters)
+        session = _unwrap_list_value(session)
+        skills = _unwrap_list_value(skills)
+        mcp_config = _unwrap_list_value(mcp_config)
+
+        if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != llama_model:
+            print("[llama-cpp_vlm] Loading model...")
+            LLAMA_CPP_STORAGE.load_model(llama_model)
+
+        LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
+
+        if parameters is None:
+            parameters = {}
+
+        _parameters = parameters.copy()
+        if _MTMD:
+            _parameters.pop("present_penalty", None)
+
+        uid = _resolve_state_uid(unique_id, _parameters, session)
+        _parameters.pop("state_uid", None)
+        signature = _build_session_signature(llama_model, system_prompt, skills, mcp_config, mode="chat")
+
+        base_session = _coerce_session(session or LLAMA_CPP_STORAGE.get_session(uid), uid, signature)
+        history = []
+        if base_session.messages:
+            history = [
+                message
+                for message in json.loads(json.dumps(base_session.messages))
+                if message.get("role") != "system"
+            ]
+
+        messages = []
+        if system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt})
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_prompt})
+
+        runner = AgentRunner(
+            LLAMA_CPP_STORAGE.llm,
+            seed=seed,
+            parameters=_parameters,
+            skill_library=skills,
+            mcp_config=mcp_config,
+        )
+        result = runner.run(messages)
+        out1 = strip_thinking(result.output)
+
+        updated_session = ConversationSession(
+            state_uid=uid,
+            signature=signature,
+            messages=result.transcript,
+            turn_count=base_session.turn_count + 1,
+            last_output=out1,
+        )
+        LLAMA_CPP_STORAGE.set_session(uid, updated_session)
+
+        tool_trace = result.trace
+        selected_skill_names = result.selected_skills
+
+        if force_offload:
+            LLAMA_CPP_STORAGE.clean()
+        else:
+            if LLAMA_CPP_STORAGE.current_config and LLAMA_CPP_STORAGE.current_config["chat_handler"] in [
+                "Qwen3.5", "Qwen3.5-Thinking", "Qwen3.6", "Qwen3.6-Thinking", "Qwen3.8", "Qwen3.8-Thinking"
+            ]:
+                LLAMA_CPP_STORAGE.llm.n_tokens = 0
+                LLAMA_CPP_STORAGE.llm._ctx.memory_clear(True)
+                if LLAMA_CPP_STORAGE.llm.is_hybrid and LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr is not None:
+                    LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr.clear()
+
+        gc.collect()
+        return (
+            out1,
+            [out1],
+            uid,
+            json.dumps(tool_trace, ensure_ascii=False, indent=2),
+            json.dumps(selected_skill_names, ensure_ascii=False),
+            updated_session,
+        )
+
 class llama_cpp_clean_states:
     @classmethod
     def INPUT_TYPES(s):
@@ -1986,6 +2172,7 @@ NODE_CLASS_MAPPINGS = {
     "llama_cpp_skill_library": llama_cpp_skill_library,
     "llama_cpp_mcp_config": llama_cpp_mcp_config,
     "llama_cpp_agent_instruct": llama_cpp_agent_instruct,
+    "llama_cpp_agent_chat": llama_cpp_agent_chat,
     "llama_cpp_unload_model": llama_cpp_unload_model,
     "llama_cpp_clean_states": llama_cpp_clean_states,
     "parse_json_node": parse_json_node,
@@ -2005,6 +2192,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "llama_cpp_skill_library": "Llama-cpp Skill Library",
     "llama_cpp_mcp_config": "Llama-cpp MCP Config",
     "llama_cpp_agent_instruct": "Llama-cpp Agent Instruct",
+    "llama_cpp_agent_chat": "Llama-cpp Agent Chat",
     "llama_cpp_unload_model": "Llama-cpp Unload Model",
     "llama_cpp_clean_states": "Llama-cpp Clean States",
     "parse_json_node": "Parse JSON",

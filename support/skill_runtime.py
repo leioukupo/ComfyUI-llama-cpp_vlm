@@ -248,6 +248,9 @@ class SkillLibrary:
         names = ", ".join(entry.name for entry in available) or "none"
         raise ValueError(f'Unknown or unselected skill "{skill_name}". Available skills: {names}')
 
+    def canonical_name(self, skill_name: str) -> str:
+        return self._entry_for_name(skill_name).name
+
     def _resolve_skill_path(self, entry: SkillEntry, relative_path: str, language: str) -> Path:
         if not relative_path or relative_path in {"SKILL.md", "SKILL.cn.md"}:
             return entry.choose_file(language)
