@@ -565,6 +565,16 @@ def _is_context_overflow_error(exc: BaseException) -> bool:
     return "context shift" in text or ("n_ctx" in text and "context" in text)
 
 
+def _is_decode_resource_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "llama.eval(decode)" in text
+        or "failed completely even with batch size 1" in text
+        or "kv slots completely full" in text
+        or "no kv slot" in text
+    )
+
+
 def _is_native_tool_template_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     exc_name = type(exc).__name__.lower()
@@ -629,6 +639,16 @@ def _context_overflow_message(n_ctx: int) -> str:
         f"Current n_ctx is {n_ctx}. Increase Llama-cpp Model Loader n_ctx "
         "(32768 or 65536 is recommended for Qwen3.5 Agent workflows), "
         "clear saved conversation state, or reduce Skill Library max_skill_chars / MCP max_tool_result_chars."
+    )
+
+
+def _decode_resource_message(n_ctx: int) -> str:
+    return (
+        "llama.cpp decode failed after reducing batch size to 1, which usually means the KV cache/context "
+        "or CUDA memory budget is exhausted for this turn. "
+        f"Current n_ctx is {n_ctx}. For Qwen3.5-27B on a 24GB 3090, try auto_max_ctx/n_ctx=24576 "
+        "or 16384, set Parameters max_tokens=512, then restart this Live Chat session. "
+        "If the dialogue is very long, clear the session or reduce Skill Library max_skill_chars / MCP max_tool_result_chars."
     )
 
 
@@ -711,9 +731,12 @@ class AgentRunner:
                 try:
                     completion = self._create_chat_completion(working_messages, tools)
                 except RuntimeError as exc:
-                    if not _is_context_overflow_error(exc):
+                    if _is_context_overflow_error(exc):
+                        message = _context_overflow_message(_llm_context_size(self.llm))
+                    elif _is_decode_resource_error(exc):
+                        message = _decode_resource_message(_llm_context_size(self.llm))
+                    else:
                         raise
-                    message = _context_overflow_message(_llm_context_size(self.llm))
                     trace.append({"step": step, "error": message, "exception": str(exc)[:4000], "branch": "error"})
                     return AgentRunResult(
                         output=message,

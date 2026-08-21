@@ -691,6 +691,22 @@ battle animation
         self.assertIn("Increase Llama-cpp Model Loader n_ctx", result.output)
         self.assertTrue(result.trace[0].get("error"))
 
+    def test_agent_decode_resource_error_returns_actionable_message(self):
+        class FakeLLM:
+            def n_ctx(self):
+                return 32768
+
+            def create_chat_completion(self, **kwargs):
+                raise RuntimeError("Llama.eval(decode): Failed completely even with batch size 1.")
+
+        result = AgentRunner(FakeLLM(), seed=0).run(
+            [{"role": "user", "content": "Generate a project brief."}]
+        )
+
+        self.assertIn("decode failed", result.output)
+        self.assertIn("auto_max_ctx/n_ctx=24576", result.output)
+        self.assertTrue(result.trace[0].get("error"))
+
     def test_agent_auto_language_reads_chinese_skill(self):
         with tempfile.TemporaryDirectory() as tmp:
             skill_dir = Path(tmp) / "demo"

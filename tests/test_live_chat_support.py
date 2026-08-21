@@ -234,6 +234,33 @@ class TestLiveChatRuntime(unittest.TestCase):
         self.assertNotIn("请稍候", transcript)
         self.assertTrue(any(event.get("branch") == "progress_placeholder_continue" for event in result.tool_trace))
 
+    def test_live_run_reports_decode_resource_error_with_actionable_message(self):
+        class DecodeFailLLM:
+            def n_ctx(self):
+                return 32768
+
+            def create_chat_completion(self, **kwargs):
+                raise RuntimeError("Llama.eval(decode): Failed completely even with batch size 1.")
+
+        manager = LiveChatManager()
+        signature = build_live_session_signature("demo.gguf", "hello", {"temperature": 0.7})
+        session = manager.open_session("node-1", "node-1", signature, "hello")
+
+        result = run_live_chat(
+            manager,
+            DecodeFailLLM(),
+            seed=0,
+            parameters={},
+            session=session,
+            should_stop=lambda: False,
+            emit_state=lambda current_session, event: None,
+            initial_user_message="16:9 横屏 10s",
+        )
+
+        self.assertIn("decode failed", result.error)
+        self.assertIn("auto_max_ctx/n_ctx=24576", result.error)
+        self.assertNotIn("Live chat generation failed", result.error)
+
 
 if __name__ == "__main__":
     unittest.main()

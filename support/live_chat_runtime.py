@@ -8,7 +8,9 @@ from .agent_runtime import (
     AgentRunner,
     STATUS_ERROR as AGENT_STATUS_ERROR,
     _context_overflow_message,
+    _decode_resource_message,
     _is_context_overflow_error,
+    _is_decode_resource_error,
     _llm_context_size,
     _message_from_completion,
     _progress_placeholder_continue_prompt,
@@ -375,8 +377,11 @@ def run_live_chat(
                 full_messages.append({"role": "user", "content": _progress_placeholder_continue_prompt(reply)})
                 reply = generate_chat_reply(llm, seed, full_messages, parameters)
         except Exception as exc:
-            if isinstance(exc, RuntimeError) and _is_context_overflow_error(exc):
-                reply = _context_overflow_message(_llm_context_size(llm))
+            if isinstance(exc, RuntimeError) and (_is_context_overflow_error(exc) or _is_decode_resource_error(exc)):
+                if _is_decode_resource_error(exc):
+                    reply = _decode_resource_message(_llm_context_size(llm))
+                else:
+                    reply = _context_overflow_message(_llm_context_size(llm))
                 session.status = STATUS_ERROR
                 session.error = reply
                 emit_state(session, "error")
