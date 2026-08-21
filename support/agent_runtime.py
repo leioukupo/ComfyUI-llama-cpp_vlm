@@ -19,7 +19,8 @@ If you cannot produce the requested final result without the user's choice or mi
 Tool calls are executed automatically by the workflow. Do not claim that a tool was used unless the tool result is present in the conversation.
 If native tool calling is unavailable, request tools by replying with only this JSON shape:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
-After tool results are returned, continue normally and provide the final answer only."""
+After tool results are returned, continue normally and provide the final answer only.
+Do not answer with progress placeholders such as "please wait", "I will generate it", or "正在生成". If you say you will create an artifact, create it in the same response."""
 
 STATUS_COMPLETE = "complete"
 STATUS_AWAITING_USER = "awaiting_user"
@@ -276,6 +277,58 @@ def looks_like_user_question(text: str) -> bool:
     if has_question_mark and any(re.search(pattern, value, flags=re.IGNORECASE | re.DOTALL) for pattern in patterns):
         return True
     return bool(re.search(r"(你|您).*(希望|想|选择|提供|补充).*[？?]", value, flags=re.DOTALL))
+
+
+def looks_like_progress_placeholder(text: str) -> bool:
+    value = strip_thinking(text)
+    if not value or len(value) > 1200:
+        return False
+
+    lowered = value.lower()
+    placeholder_patterns = [
+        r"请稍候",
+        r"请稍等",
+        r"稍等",
+        r"马上.*生成",
+        r"正在生成",
+        r"接下来.*生成",
+        r"我将.*生成",
+        r"我会.*生成",
+        r"please wait",
+        r"one moment",
+        r"working on",
+        r"i will .*generate",
+        r"i'll .*generate",
+    ]
+    if not any(re.search(pattern, value, flags=re.IGNORECASE | re.DOTALL) for pattern in placeholder_patterns):
+        return False
+
+    artifact_markers = [
+        "工作标题",
+        "项目简报",
+        "一句话 what-if",
+        "情绪前提",
+        "主要交付物",
+        "working title",
+        "project brief",
+        "emotional premise",
+        "main deliverables",
+    ]
+    has_artifact_marker = any(marker in lowered for marker in artifact_markers)
+    has_structured_body = bool(re.search(r"(^|\n)\s*(#{1,3}\s|\d+[.、]\s|[-*]\s)", value))
+    return not (has_artifact_marker and has_structured_body)
+
+
+def _progress_placeholder_continue_prompt(text: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", text or ""):
+        return (
+            "你刚才只输出了进度提示。请现在直接输出承诺要生成的完整内容；"
+            "不要再说请稍候、正在生成、接下来我将，也不要要求用户等待。"
+        )
+    return (
+        "You only replied with a progress placeholder. Output the promised complete artifact now. "
+        "Do not say please wait, working on it, or that you will generate it later."
+    )
 
 
 def _pending_question_id(question: str, fields: List[str]) -> str:
@@ -707,12 +760,30 @@ class AgentRunner:
                     )
 
                 if not calls:
+                    clean_content = strip_thinking(content)
+                    if looks_like_progress_placeholder(clean_content) and step < max_steps:
+                        working_messages.append({"role": "assistant", "content": clean_content})
+                        working_messages.append(
+                            {
+                                "role": "user",
+                                "content": _progress_placeholder_continue_prompt(clean_content),
+                            }
+                        )
+                        trace.append(
+                            {
+                                "step": step,
+                                "branch": "progress_placeholder_continue",
+                                "assistant": clean_content[:4000],
+                            }
+                        )
+                        continue
+
                     sanitized_assistant = _sanitize_message_for_transcript(assistant_message)
-                    if not sanitized_assistant.get("content") and strip_thinking(content):
-                        sanitized_assistant["content"] = strip_thinking(content)
+                    if not sanitized_assistant.get("content") and clean_content:
+                        sanitized_assistant["content"] = clean_content
                     transcript.append(sanitized_assistant)
                     return AgentRunResult(
-                        output=strip_thinking(content),
+                        output=clean_content,
                         trace=trace,
                         selected_skills=selected_skills,
                         transcript=transcript,

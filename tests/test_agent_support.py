@@ -12,6 +12,7 @@ from support.agent_runtime import (
     STATUS_AWAITING_USER,
     build_session_signature,
     extract_tool_calls,
+    looks_like_progress_placeholder,
     looks_like_user_question,
     normalize_session,
     patch_llama_template_compatibility,
@@ -480,6 +481,44 @@ zh
         self.assertTrue(looks_like_user_question("你希望哪种风格？"))
         self.assertTrue(looks_like_user_question("Which style would you like?"))
         self.assertFalse(looks_like_user_question("Here is the final prompt for a 15 second video."))
+
+    def test_progress_placeholder_auto_continues(self):
+        class FakeLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def create_chat_completion(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "请稍候，正在生成项目简报..."
+                                }
+                            }
+                        ]
+                    }
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "## 项目简报\n- 工作标题：小男孩与怪兽"
+                            }
+                        }
+                    ]
+                }
+
+        fake_llm = FakeLLM()
+        result = AgentRunner(fake_llm, seed=0).run(
+            [{"role": "user", "content": "16:9 横屏 10s"}]
+        )
+
+        self.assertTrue(looks_like_progress_placeholder("请稍候，正在生成项目简报..."))
+        self.assertEqual(fake_llm.calls, 2)
+        self.assertIn("项目简报", result.output)
+        self.assertNotIn("请稍候", result.transcript_json())
+        self.assertTrue(any(event.get("branch") == "progress_placeholder_continue" for event in result.trace))
 
     def test_patch_llama_template_compatibility_injects_raise_exception(self):
         class FakeEnv:

@@ -11,7 +11,9 @@ from .agent_runtime import (
     _is_context_overflow_error,
     _llm_context_size,
     _message_from_completion,
+    _progress_placeholder_continue_prompt,
     build_session_signature,
+    looks_like_progress_placeholder,
     patch_llama_template_compatibility,
     strip_thinking,
 )
@@ -75,10 +77,11 @@ def build_live_session_signature(
     skills: Any = None,
     mcp_config: Any = None,
 ) -> str:
+    # Keep the selected model out of the signature so a live transcript can
+    # continue across local model switches.
     return build_session_signature(
         {
             "mode": "live_chat",
-            "llama_model": llama_model,
             "system_prompt": system_prompt or "",
             "parameters": parameters or {},
             "skills": skills,
@@ -358,6 +361,19 @@ def run_live_chat(
                 continue
 
             reply = generate_chat_reply(llm, seed, full_messages, parameters)
+            for _ in range(2):
+                if not looks_like_progress_placeholder(reply):
+                    break
+                session.tool_trace.append(
+                    {
+                        "step": len(session.tool_trace) + 1,
+                        "branch": "progress_placeholder_continue",
+                        "assistant": reply[:4000],
+                    }
+                )
+                full_messages.append({"role": "assistant", "content": reply})
+                full_messages.append({"role": "user", "content": _progress_placeholder_continue_prompt(reply)})
+                reply = generate_chat_reply(llm, seed, full_messages, parameters)
         except Exception as exc:
             if isinstance(exc, RuntimeError) and _is_context_overflow_error(exc):
                 reply = _context_overflow_message(_llm_context_size(llm))

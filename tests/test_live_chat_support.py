@@ -115,6 +115,48 @@ class TestLiveChatRuntime(unittest.TestCase):
         self.assertEqual(session_b.messages, [])
         self.assertIsNot(session_a, session_b)
 
+    def test_model_switch_preserves_live_session_messages(self):
+        manager = LiveChatManager()
+        sig_a = build_live_session_signature("demo-a.gguf", "hello", {"temperature": 0.7})
+        sig_b = build_live_session_signature("demo-b.gguf", "hello", {"temperature": 0.7})
+        session_a = manager.open_session("node-1", "node-1", sig_a, "hello")
+        session_a.append_user_message("A")
+
+        session_b = manager.open_session("node-1", "node-1", sig_b, "hello")
+
+        self.assertIs(session_a, session_b)
+        self.assertEqual(session_b.messages, [{"role": "user", "content": "A"}])
+
+    def test_ended_session_rejects_followup_message(self):
+        manager = LiveChatManager()
+        signature = build_live_session_signature("demo.gguf", "hello", {"temperature": 0.7})
+        session = manager.open_session("node-1", "node-1", signature, "hello")
+        session.append_user_message("A")
+        session.status = STATUS_ENDED
+        session.stop_requested = True
+
+        accepted = session.queue_user_message("继续")
+
+        self.assertFalse(accepted)
+        self.assertEqual(session.status, STATUS_ENDED)
+        self.assertTrue(session.stop_requested)
+        self.assertEqual(session.pending_user_messages, [])
+        self.assertEqual(session.messages, [{"role": "user", "content": "A"}])
+
+    def test_open_session_resets_ended_live_session(self):
+        manager = LiveChatManager()
+        signature = build_live_session_signature("demo.gguf", "hello", {"temperature": 0.7})
+        session_a = manager.open_session("node-1", "node-1", signature, "hello")
+        session_a.append_user_message("A")
+        session_a.status = STATUS_ENDED
+        session_a.stop_requested = True
+
+        session_b = manager.open_session("node-1", "node-1", signature, "hello")
+
+        self.assertIsNot(session_a, session_b)
+        self.assertFalse(session_b.stop_requested)
+        self.assertEqual(session_b.messages, [])
+
     def test_live_run_can_use_skill_tools_without_polluting_transcript(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -158,6 +200,39 @@ class TestLiveChatRuntime(unittest.TestCase):
             self.assertIn("最终提示词", result.last_output)
             self.assertIn("最终提示词", transcript)
             self.assertNotIn("Tool results:", transcript)
+
+    def test_live_run_continues_progress_placeholder_reply(self):
+        manager = LiveChatManager()
+        signature = build_live_session_signature("demo.gguf", "hello", {"temperature": 0.7})
+        session = manager.open_session("node-1", "node-1", signature, "hello")
+
+        def emit_state(current_session, event):
+            if event == "assistant":
+                manager.end_session(node_id="node-1")
+
+        result = run_live_chat(
+            manager,
+            FakeLLM(
+                [
+                    "请稍候，正在生成项目简报...",
+                    "## 项目简报\n- 工作标题：小男孩与怪兽",
+                ]
+            ),
+            seed=0,
+            parameters={},
+            session=session,
+            should_stop=lambda: False,
+            emit_state=emit_state,
+            initial_user_message="16:9 横屏 10s",
+        )
+
+        transcript = render_transcript(result.messages)
+
+        self.assertEqual(result.status, STATUS_ENDED)
+        self.assertIn("项目简报", result.last_output)
+        self.assertIn("项目简报", transcript)
+        self.assertNotIn("请稍候", transcript)
+        self.assertTrue(any(event.get("branch") == "progress_placeholder_continue" for event in result.tool_trace))
 
 
 if __name__ == "__main__":

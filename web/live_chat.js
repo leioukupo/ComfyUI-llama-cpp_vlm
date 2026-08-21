@@ -223,6 +223,12 @@ function setLiveControlsBusy(node, busy) {
     if (!controls) {
         return;
     }
+    if (!busy) {
+        controls.sendButton.style.opacity = "1";
+        controls.endButton.style.opacity = "1";
+        updateLiveControls(node, node.__llamaLiveSession);
+        return;
+    }
     controls.sendButton.disabled = Boolean(busy);
     controls.endButton.disabled = Boolean(busy);
     controls.sendButton.style.opacity = busy ? "0.6" : "1";
